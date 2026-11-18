@@ -1,153 +1,152 @@
-# USAGE — `tsdb2parqtel` runbooks
+# Usage — `tsdb2parqtel`
 
-- **Audience:** operators and engineers running the CLI.
-- **Audience note:** these are runbooks for the tool we are building. They are
-  written against the Phase 0 design (`docs/DESIGN.md`) and will be updated as
-  the implementation lands.
+`tsdb2parqtel` converts persisted Prometheus/Thanos TSDB blocks into Parqtel
+Parquet blocks, or replays them into a running Parqtel over OTLP/HTTP.
 
----
+Build:
 
-## 1. `inspect <source>`
-
-**Purpose:** no writes. Report what the source contains, so a migration can be
-planned without touching data.
-
-```
-cargo run -p tsdb-reader -- inspect /var/lib/parqtel/prometheus/blocks
+```bash
+cargo build --release
+./target/release/tsdb2parqtel --help
 ```
 
-Reports, per block:
+Exit codes: `0` success, `1` generic error, `2` source not found/unreadable,
+`3` partial success with `--on-error=skip`, `4` verification mismatch, `5`
+retention refusal.
 
-- block start/end timestamp (ns),
-- row count (samples) and estimated output size,
-- external labels / downsample resolution / source (Thanos),
-- series count, sample count, chunk statistics,
-- top label cardinality (by value) so an operator knows what they are importing.
+## Migrate a local Prometheus data directory
 
-Exit codes: `0` ok, `2` source unreadable / empty, `3` partial (see `--on-error=skip`).
-
----
-
-## 2. `plan <source> ...`
-
-**Purpose:** dry run. No files written. Prints the intended output windows,
-estimated rows/files, the label mapping preview for sampled series, and any
-retention conflict (data older than the target retention would be swept on first
-query).
-
-```
-cargo run -p tsdb-reader -- plan /var/lib/thanos/buckets/prod \
-    --min-time 2026-01-01T00:00:00Z --max-time 2026-02-01T00:00:00Z \
-    --matcher 'job="api"' --downsampled=prefer-raw
+```bash
+tsdb2parqtel inspect /var/lib/prometheus/blocks --top-labels 10
+tsdb2parqtel plan /var/lib/prometheus/blocks \
+  --min-time 2026-01-01T00:00:00Z --max-time 2026-02-01T00:00:00Z
+tsdb2parqtel convert /var/lib/prometheus/blocks \
+  --out /var/lib/parqtel/staging \
+  --min-time 2026-01-01T00:00:00Z --max-time 2026-02-01T00:00:00Z \
+  --sidecar
+tsdb2parqtel verify /var/lib/prometheus/blocks /var/lib/parqtel/staging
 ```
 
-`--downsampled=prefer-raw` is the default; the flag exists because Parqtel's
-compaction/flush story assumes raw blocks for recent windows.
+`files` output is `m_l0_{start_ns}_{end_ns}_{uuid32}.parquet`; the UUID is a
+UUIDv5 of source block ULID + window + part, so re-running the same source with
+the same flags overwrites the same names instead of duplicating samples.
 
----
+To install into a stopped Parqtel data directory and merge its index:
 
-## 3. `convert <source> --out <dir> ...`
-
-**Purpose:** write Parqtel metric blocks into a data directory (mode `files`) or
-emit them into a running Parqtel (mode `otlp`).
-
-```
-# mode: files (write into a staging dir + optional index sidecar fragment)
-cargo run -p tsdb2parqtel -- convert /var/lib/parqtel/prometheus/blocks \
-    --out /tmp/parqtel-converted \
-    --min-time 2026-01-01T00:00:00Z --max-time 2026-02-01T00:00:00Z \
-    --matcher 'job="api"' \
-    --label-mapping /etc/parqtel/label-map.yaml \
-    --label-mode preserve
-
-# mode: otlp (live clone into a running Parqtel)
-cargo run -p tsdb2parqtel -- clone /var/lib/thanos/buckets/prod \
-    --target otlp://127.0.0.1:4317 \
-    --min-time ... --max-time ... \
-    --checkpoint /var/lib/parqtel/clones/api-checkpoint.json
+```bash
+tsdb2parqtel clone /var/lib/prometheus/blocks \
+  --target /var/lib/parqtel/data \
+  --min-time 2026-01-01T00:00:00Z --max-time 2026-02-01T00:00:00Z
+# restart parqtel; a live server does not reload index.json
 ```
 
-`files` mode:
+The tool refuses to mutate a target with WAL files unless `--force`.
 
-- writes `m_l0_{start}_{end}_{uuid32hex}.parquet` under `--out`,
-- writes `.tmp_<name>` then `rename`,
-- optional sidecar fragment (index entry) when `--install` is passed;
-  never overwrites a live server index without `--force` (and refuses when a
-  running server's WAL is detected).
+## Migrate a Thanos bucket range
 
-`otlp` mode:
-
-- replays series through Parqtel's OTLP ingest endpoints,
-- bodies kept under the server's 10 MB limit; backpressure surfaced as `413`/`429`
-  with jittered retries; idempotent via checkpoint.
-
----
-
-## 4. `clone <source> --target <data-dir | otlp-url> ...`
-
-**Purpose:** convert + install / ingest in one pass, with checkpoint/resume.
-
-```
-cargo run -p tsdb2parqtel -- clone /var/lib/thanos/buckets/prod \
-    --target /var/lib/parqtel \
-    --min-time 2026-01-01T00:00:00Z --max-time 2026-02-01T00:00:00Z \
-    --checkpoint /var/lib/parqtel/clones/api-checkpoint.json
+```bash
+export AWS_REGION=eu-north-1
+# credentials from the standard AWS provider chain; never put them in argv
+tsdb2parqtel inspect s3://my-thanos-bucket/prod \
+  --min-time 2026-01-01T00:00:00Z --max-time 2026-02-01T00:00:00Z
+tsdb2parqtel convert s3://my-thanos-bucket/prod \
+  --out ./thanos-parquet \
+  --min-time 2026-01-01T00:00:00Z --max-time 2026-02-01T00:00:00Z \
+  --external-labels include \
+  --downsampled prefer-raw
 ```
 
-The checkpoint stores per-series ingest position so a re-run resumes rather than
-duplicates.
+GCS and Azure use `gs://bucket/prefix` and `az://container/prefix`; the same
+standard provider chains apply. The source is staged into a temporary directory
+and deleted when the command exits.
 
----
+## Select blocks and series
 
-## 5. `verify <source> <parqtel-blocks | parqtel-url>`
+```bash
+# One or more block ULIDs
+--block-ulid 01ARZ3NDEKTSV4RRFFQ69G5FAV --block-ulid 01ARZ3NDEKTSV4RRFFQ69G5FAW
 
-```
-# against a directory of Parqtel-produced blocks
-cargo run -p tsdb2parqtel -- verify /var/lib/thanos/buckets/prod \
-    /tmp/parqtel-converted --json /tmp/verify-report.json
+# PromQL-style label matcher (sequential scan; postings are not used)
+--matcher '{job="api",severity!="info"}'
 
-# against a live Parqtel instance (via its query API)
-cargo run -p tsdb2parqtel -- verify /var/lib/thanos/buckets/prod \
-    otlp://http://127.0.0.1:8080 --json /tmp/verify-report.json
-```
+# Filter on Thanos external labels
+--external-label-filter '{cluster="prod"}'
 
-Compares, per series: label set, sample count, first/last timestamps, and a
-xxhash of the `(timestamp_ns, value)` stream. Exits non-zero on any mismatch.
+# Replica dedup, removing the replica label from output
+--dedup-replica-label replica
 
----
-
-## 6. Retention warning
-
-Before `clone --target <data-dir>`, check the target config:
-
-```
-cargo run -p tsdb2parqtel -- inspect /var/lib/parqtel --config /etc/parqtel/config.toml
+# Corrupt input behavior
+--on-error fail|skip
 ```
 
-If `storage.retention_days < (range span / 86400)`, data will be swept
-immediately on first flush. The tool prints the exact config key to raise and
-exits non-zero (or warns, per `--retention-action warn|refuse`).
+Default stale-marker behavior is `drop`; use `--stale-markers keep` for a
+bit-exact archive. Default external-label behavior is `include`; use
+`--external-labels ignore` to compare raw Prometheus series.
 
----
+## Live clone into a running Parqtel
 
-## 7. Typical migration runbook
+```bash
+tsdb2parqtel clone /var/lib/thanos/bucket/prod \
+  --target http://parqtel.internal:8080 \
+  --min-time 2026-01-01T00:00:00Z --max-time 2026-02-01T00:00:00Z \
+  --checkpoint /var/lib/parqtel/clones/prod.json
+```
 
-1. `inspect <source>` → size, ranges, series counts.
-2. `plan <source>` → windows, mapping preview, retention check.
-3. `convert <source> --out <dir> --install` → write blocks + sidecar fragment.
-4. Start / restart Parqtel against `<dir>`.
-5. `verify <source> <parqtel-blocks>` → per-series equality.
-6. Re-run `convert` → confirm idempotence (no duplicate samples).
+The sink sends OTLP/HTTP JSON to `/v1/metrics/json`, keeps each body under 4 MiB,
+splits a series into timestamp-ordered batches, retries `429`/`5xx`/timeouts
+with jittered backoff, and checkpoints the last acknowledged timestamp per
+series. Re-running resumes after that timestamp.
 
----
+Verify a live instance (one instant query per source sample; slow but exact):
 
-## 8. Exit codes (final design)
+```bash
+tsdb2parqtel verify /var/lib/thanos/bucket/prod http://parqtel.internal:8080 \
+  --min-time 2026-01-01T00:00:00Z --max-time 2026-02-01T00:00:00Z
+```
 
-| Code | Meaning |
+## Verify a converted directory
+
+```bash
+tsdb2parqtel verify /var/lib/prometheus/blocks ./thanos-parquet \
+  --json --report /tmp/verify.json
+```
+
+The verifier compares per series: label set, sample count, first/last timestamp
+and an ordered xxhash of `(timestamp_ns, value_bits)`. It exits `4` on any
+missing, extra or mismatched series. A Parquet output must carry the
+`parqtel.series_index` footer; legacy row-level labels are not read by `verify`.
+
+## Configuration and retention
+
+Useful output flags:
+
+```text
+--block-duration-secs 7200       Parqtel metric window
+--max-rows-per-block 1000000
+--row-group-size 100000
+--compression zstd|snappy|lz4|none
+--compression-level 1..22
+--label-mode preserve|otel       preserve is identity-preserving
+--label-mapping mapping.json
+--metadata-file metadata.json
+--target-retention-days 7        warn/refuse if imported data is already expired
+--retention-action warn|refuse
+--sidecar                        write index.fragment.json
+--force                          allow index install despite WAL presence
+```
+
+The exact Parqtel key to raise for metric retention is
+`storage.retention_days`; logs use `logs.retention_days`. Parqtel's retention
+task runs hourly and deletes blocks whose entire range is older than the cutoff.
+The converter warns when the oldest imported window is older than the configured
+target retention and exits `5` when `--retention-action refuse` is set.
+
+## Common failure messages
+
+| Message | Meaning |
 |---|---|
-| 0 | success |
-| 1 | generic error (source unreadable, writer failed) |
-| 2 | source unreadable / empty / not found |
-| 3 | partial success with `--on-error=skip` |
-| 4 | verification mismatch (from `verify`) |
-| 5 | retention refusal (from `clone --target`) |
+| `series ref N ... native histogram sample(s)` | Parqtel has no schema-preserving native histogram column; use `--on-error=skip` and read `docs/LIMITATIONS.md` |
+| `checksum mismatch` | source block is corrupt; never trust that series |
+| `unsupported object-store scheme` | use `s3://`, `gs://` or `az://` |
+| `contains WAL data; stop the server or pass --force` | target may be live; index install is unsafe |
+| `retention warning` | imported range is older than the target retention |

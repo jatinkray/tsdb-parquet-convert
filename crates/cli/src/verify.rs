@@ -187,6 +187,125 @@ fn read_parquet_block(path: &Path, out: &mut BTreeMap<String, Digest>) -> Result
     Ok(())
 }
 
+/// Verifies a live Parqtel instance by asking one instant query per source
+/// sample. This is deliberately slow but exact: a range query would interpolate
+/// or advance to its step and could hide a timestamp mismatch.
+pub fn verify_live(options: &VerifyOptions, target: &str) -> Result<VerifyReport> {
+    let source = Source::open(options.source.clone())?;
+    let endpoint = if target.ends_with("/api/v1/query") {
+        target.to_string()
+    } else {
+        format!("{}/api/v1/query", target.trim_end_matches('/'))
+    };
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let mut source_digests: BTreeMap<String, Digest> = BTreeMap::new();
+    let mut live_digests: BTreeMap<String, Digest> = BTreeMap::new();
+    source.scan(|record| {
+        let Some(metric) = record.metric_name().map(str::to_string) else {
+            return Ok(());
+        };
+        let mapped = options
+            .label_mapper
+            .map(&record.labels)
+            .map_err(|error| tsdb_reader::Error::Source(error.to_string()))?;
+        let key = series_key(&metric, mapped.labels.json_str());
+        let selector = build_selector(&metric, &record.labels);
+        let source_digest = source_digests.entry(key.clone()).or_default();
+        let live_digest = live_digests.entry(key).or_default();
+        for sample in record.samples {
+            let timestamp_ns = sample.timestamp_ms.checked_mul(1_000_000).ok_or(
+                tsdb_reader::Error::TimestampOutOfRange {
+                    timestamp_ms: sample.timestamp_ms,
+                },
+            )?;
+            add_sample(source_digest, timestamp_ns, sample.value.to_bits());
+            let time = format!("{:.3}", sample.timestamp_ms as f64 / 1000.0);
+            let response = client
+                .get(&endpoint)
+                .query(&[("query", selector.as_str()), ("time", time.as_str())])
+                .send()
+                .and_then(reqwest::blocking::Response::error_for_status)
+                .map_err(|error| {
+                    tsdb_reader::Error::Source(format!("querying {endpoint}: {error}"))
+                })?;
+            let body: serde_json::Value = response.json().map_err(|error| {
+                tsdb_reader::Error::Source(format!("decoding query response: {error}"))
+            })?;
+            let value = body
+                .get("data")
+                .and_then(|data| data.get("result"))
+                .and_then(|result| result.as_array())
+                .and_then(|result| result.first())
+                .and_then(|series| series.get("value"))
+                .and_then(|value| value.get(1))
+                .and_then(|value| value.as_str())
+                .and_then(|value| value.parse::<f64>().ok());
+            if let Some(value) = value {
+                add_sample(live_digest, timestamp_ns, value.to_bits());
+            }
+        }
+        Ok(())
+    })?;
+
+    let mut report = VerifyReport {
+        source_series: source_digests.len(),
+        output_series: live_digests.len(),
+        source_samples: source_digests.values().map(|digest| digest.samples).sum(),
+        output_samples: live_digests.values().map(|digest| digest.samples).sum(),
+        ..VerifyReport::default()
+    };
+    for (key, source) in &source_digests {
+        match live_digests.get(key) {
+            None => report.missing.push(key.clone()),
+            Some(live) if live.hash != source.hash || live.samples != source.samples => {
+                report.mismatched.push(Mismatch {
+                    series: key.clone(),
+                    source: source.clone(),
+                    output: live.clone(),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    for key in live_digests.keys() {
+        if !source_digests.contains_key(key) {
+            report.extra.push(key.clone());
+        }
+    }
+    Ok(report)
+}
+
+fn build_selector(metric: &str, labels: &tsdb_reader::Labels) -> String {
+    let mut out = String::from(metric);
+    let mut first = true;
+    for (key, value) in labels {
+        if key == "__name__" {
+            continue;
+        }
+        if first {
+            out.push('{');
+            first = false;
+        } else {
+            out.push(',');
+        }
+        out.push_str(key);
+        out.push_str("=\"");
+        for ch in value.chars() {
+            if ch == '\\' || ch == '"' {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+        out.push('"');
+    }
+    if !first {
+        out.push('}');
+    }
+    out
+}
+
 fn series_key(metric: &str, labels_json: &str) -> String {
     format!("{metric}{labels_json}")
 }

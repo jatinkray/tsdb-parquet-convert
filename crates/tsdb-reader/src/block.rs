@@ -55,7 +55,19 @@ impl Block {
                 .chunks
                 .read_chunk(chunk.reference)
                 .map_err(|e| block_error(self, series, e))?;
-            let crate::chunks::ChunkSamples::Floats(chunk_samples) = decoded;
+            let chunk_samples = match decoded {
+                crate::chunks::ChunkSamples::Floats(samples) => samples,
+                crate::chunks::ChunkSamples::Histograms(histograms) => {
+                    return Err(Error::Block {
+                        ulid: self.ulid().to_string(),
+                        message: format!(
+                            "series {} carries {} native histogram sample(s); Parqtel has no schema-preserving native-histogram column (see docs/LIMITATIONS.md). Use --on-error=skip to omit it.",
+                            series.id,
+                            histograms.len()
+                        ),
+                    });
+                }
+            };
             samples.extend(chunk_samples.into_iter().filter(|sample| {
                 sample.timestamp_ms >= min_time_ms
                     && sample.timestamp_ms <= max_time_ms

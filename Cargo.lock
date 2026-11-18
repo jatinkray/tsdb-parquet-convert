@@ -1723,6 +1723,7 @@ dependencies = [
  "futures-util",
  "http",
  "http-body-util",
+ "httparse",
  "humantime",
  "hyper",
  "itertools",
@@ -2995,6 +2996,8 @@ name = "tsdb-reader"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "futures",
+ "object_store",
  "parqtel-sink",
  "proptest",
  "regex",
@@ -3002,8 +3005,20 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
+ "tsdb-reader 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "walkdir",
+]
+
+[[package]]
+name = "tsdb-reader"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d679f86eff1d162d2c4c54e0a5f371090414e0077c691c217510343b7d77d5d0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3020,13 +3035,14 @@ dependencies = [
  "parqtel-sink",
  "parquet",
  "rayon",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serde_yaml",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "tsdb-reader",
+ "tsdb-reader 0.1.0",
  "walkdir",
  "xxhash-rust",
 ]

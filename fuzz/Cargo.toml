@@ -1,0 +1,24 @@
+[package]
+name = "tsdb2parqtel-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tsdb-reader = { path = "../crates/tsdb-reader" }
+
+[[bin]]
+name = "xor_chunk"
+path = "fuzz_targets/xor_chunk.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "index"
+path = "fuzz_targets/index.rs"
+test = false
+doc = false

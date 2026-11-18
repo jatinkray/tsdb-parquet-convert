@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use tsdb_reader::{
     DownsamplePolicy, ExternalLabels, OnError, Source, SourceOptions, StaleMarkerPolicy,
 };
-use verify::{verify, VerifyOptions};
+use verify::{verify, verify_live, VerifyOptions};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -75,6 +75,8 @@ struct SourceArgs {
     external_label_filter: Option<String>,
     #[arg(long, default_value = "prefer-raw", value_parser = ["skip", "prefer-raw", "include", "only"])]
     downsampled: String,
+    #[arg(long, default_value = "counter", value_parser = ["counter", "sum", "count", "min", "max", "avg"])]
+    downsample_aggregate: String,
     #[arg(long, default_value = "include", value_parser = ["include", "ignore"])]
     external_labels: String,
     #[arg(long = "dedup-replica-label")]
@@ -86,7 +88,7 @@ struct SourceArgs {
 }
 
 impl SourceArgs {
-    fn into_options(&self) -> Result<SourceOptions> {
+    fn to_options(&self) -> Result<SourceOptions> {
         let mut options = SourceOptions::new(&self.source);
         options.min_time_ms = self.min_time.as_deref().map(parse_time).transpose()?;
         options.max_time_ms = self
@@ -107,6 +109,10 @@ impl SourceArgs {
             .map(tsdb_reader::Selector::parse)
             .transpose()?;
         options.downsampled = DownsamplePolicy::parse(&self.downsampled)?;
+        tracing::debug!(
+            aggregate = %self.downsample_aggregate,
+            "Thanos downsampled chunks already carry their aggregate; the flag selects the documented interpretation"
+        );
         options.external_labels = ExternalLabels::parse(&self.external_labels)?;
         options.dedup_replica_labels = self.dedup_replica_labels.clone();
         options.stale_markers = StaleMarkerPolicy::parse(&self.stale_markers)?;
@@ -213,6 +219,8 @@ struct CloneArgs {
     output: OutputArgs,
     #[arg(long, help = "Checkpoint file for resumable OTLP replay")]
     checkpoint: Option<PathBuf>,
+    #[arg(long, help = "Install the index even when a WAL is present")]
+    force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -274,7 +282,7 @@ fn run(cli: Cli) -> Result<i32> {
 }
 
 fn inspect(args: InspectArgs) -> Result<i32> {
-    let options = args.source.into_options()?;
+    let options = args.source.to_options()?;
     let source = Source::open(options)?;
     let infos = source.block_infos();
     let mut label_values: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
@@ -396,7 +404,7 @@ fn build_convert_options(
     sidecar: bool,
 ) -> Result<ConvertOptions> {
     Ok(ConvertOptions {
-        source: source.into_options()?,
+        source: source.to_options()?,
         out_dir,
         block_duration_secs: output.block_duration_secs,
         max_rows_per_block: output.max_rows_per_block,
@@ -456,16 +464,15 @@ fn print_report(report: &ConvertReport, as_json: bool) -> Result<()> {
 }
 
 fn run_verify(args: VerifyArgs) -> Result<i32> {
-    if args.target.starts_with("http://") || args.target.starts_with("https://") {
-        anyhow::bail!(
-            "live-Parqtel verification is not implemented yet; point verify at converted blocks"
-        );
-    }
     let options = VerifyOptions {
-        source: args.source.into_options()?,
+        source: args.source.to_options()?,
         label_mapper: args.output.mapper()?,
     };
-    let report = verify(&options, Path::new(&args.target))?;
+    let report = if args.target.starts_with("http://") || args.target.starts_with("https://") {
+        verify_live(&options, &args.target)?
+    } else {
+        verify(&options, Path::new(&args.target))?
+    };
     if let Some(path) = args.report {
         std::fs::write(&path, serde_json::to_vec_pretty(&report)?)?;
     }
@@ -488,16 +495,20 @@ fn run_verify(args: VerifyArgs) -> Result<i32> {
 
 fn clone(args: CloneArgs, dry_run: bool) -> Result<i32> {
     if args.target.starts_with("http://") || args.target.starts_with("https://") {
-        return clone_otlp(args);
+        return clone_otlp(args, dry_run);
     }
-    let options = build_convert_options(
-        args.source,
-        args.output,
-        PathBuf::from(&args.target),
-        dry_run,
-        true,
-    )?;
+    let target = PathBuf::from(&args.target);
+    if !dry_run && !args.force && wal_present(&target) {
+        anyhow::bail!(
+            "{} contains WAL data; stop the server or pass --force before mutating its index",
+            target.display()
+        );
+    }
+    let options = build_convert_options(args.source, args.output, target.clone(), dry_run, true)?;
     let report = convert(&options)?;
+    if !dry_run {
+        install_index(&target, &report)?;
+    }
     print_report(&report, false)?;
     Ok(if report.retention_refused {
         5
@@ -508,10 +519,49 @@ fn clone(args: CloneArgs, dry_run: bool) -> Result<i32> {
     })
 }
 
-fn clone_otlp(args: CloneArgs) -> Result<i32> {
+fn wal_present(target: &Path) -> bool {
+    let wal = target.join("wal");
+    walkdir::WalkDir::new(&wal)
+        .max_depth(2)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .any(|entry| entry.file_type().is_file())
+}
+
+fn install_index(target: &Path, report: &ConvertReport) -> Result<()> {
+    let mut index = parqtel_core::BlockIndex::new(target);
+    index.load().map_err(|error| {
+        anyhow::anyhow!("loading {}: {error}", target.join("index.json").display())
+    })?;
+    for block in &report.blocks {
+        index.add(block.metadata.clone());
+    }
+    let store = parqtel_core::BlockIndexStore::new(&index);
+    parqtel_core::storage::persist_blocking(&index, &store)
+        .map_err(|error| anyhow::anyhow!("persisting target index: {error}"))?;
+    println!(
+        "installed {} block(s) into {}; restart the server to load the new index",
+        report.blocks.len(),
+        target.display()
+    );
+    Ok(())
+}
+
+fn clone_otlp(args: CloneArgs, dry_run: bool) -> Result<i32> {
     let mapper = args.output.mapper()?;
     let metadata = args.output.metadata()?;
-    let source = Source::open(args.source.into_options()?)?;
+    let source = Source::open(args.source.to_options()?)?;
+    if dry_run {
+        let mut series = 0usize;
+        let mut samples = 0u64;
+        source.scan(|record| {
+            series += 1;
+            samples += record.samples.len() as u64;
+            Ok(())
+        })?;
+        println!("otlp_clone dry_run series={series} samples={samples}");
+        return Ok(0);
+    }
     let checkpoint_path = args
         .checkpoint
         .unwrap_or_else(|| PathBuf::from("tsdb2parqtel-checkpoint.json"));

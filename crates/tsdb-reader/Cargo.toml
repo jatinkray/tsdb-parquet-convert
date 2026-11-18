@@ -8,12 +8,17 @@ description = "Prometheus/Thanos TSDB block source abstractions"
 
 [dependencies]
 crc32c = { workspace = true }
+futures = { workspace = true }
+object_store = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 walkdir = { workspace = true }
+tsdb-reader-upstream = { workspace = true, default-features = false }
 parqtel-sink = { path = "../parqtel-sink" }
 
 [dev-dependencies]

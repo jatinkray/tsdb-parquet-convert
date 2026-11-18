@@ -148,10 +148,24 @@ impl SeriesRecord {
 pub struct Source {
     options: SourceOptions,
     blocks: Vec<Block>,
+    _staging: Option<tempfile::TempDir>,
 }
 
 impl Source {
     pub fn open(options: SourceOptions) -> Result<Self> {
+        let root = options.root.to_string_lossy();
+        if let Some((scheme, rest)) = root.split_once("://") {
+            let (staged, temp) = stage_remote(scheme, rest, &options)?;
+            let mut local = options;
+            local.root = staged;
+            let mut source = Self::open_local(local)?;
+            source._staging = Some(temp);
+            return Ok(source);
+        }
+        Self::open_local(options)
+    }
+
+    fn open_local(options: SourceOptions) -> Result<Self> {
         let mut dirs = Vec::new();
         if options.root.join("meta.json").is_file() {
             dirs.push(options.root.clone());
@@ -229,7 +243,11 @@ impl Source {
             blocks = prefer_raw(blocks);
         }
         blocks.sort_by_key(|block| (block.meta.min_time_ms, block.meta.ulid.clone()));
-        Ok(Self { options, blocks })
+        Ok(Self {
+            options,
+            blocks,
+            _staging: None,
+        })
     }
 
     pub fn block_infos(&self) -> Vec<BlockInfo> {
@@ -349,10 +367,17 @@ impl Source {
                     (a.block_ulid.clone(), a.series_id).cmp(&(b.block_ulid.clone(), b.series_id))
                 };
                 records.sort_by(winner);
-                let labels = records
+                let mut labels = records
                     .first()
                     .map(|record| record.labels.clone())
                     .unwrap_or_default();
+                labels.retain(|key, _| {
+                    !self
+                        .options
+                        .dedup_replica_labels
+                        .iter()
+                        .any(|replica| replica == key)
+                });
                 let mut by_time: BTreeMap<i64, (String, u64, f64)> = BTreeMap::new();
                 for record in records {
                     for sample in record.samples {
@@ -380,6 +405,138 @@ impl Source {
         }
         Ok(stats)
     }
+}
+
+fn stage_remote(
+    scheme: &str,
+    rest: &str,
+    options: &SourceOptions,
+) -> Result<(PathBuf, tempfile::TempDir)> {
+    use futures::TryStreamExt;
+    use object_store::{path::Path as ObjectPath, ObjectStore, ObjectStoreExt};
+    use std::sync::Arc;
+
+    let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+    if bucket.is_empty() {
+        return Err(Error::Source(format!("{scheme} source has no bucket")));
+    }
+    let store: Arc<dyn ObjectStore> = match scheme {
+        "s3" => Arc::new(
+            object_store::aws::AmazonS3Builder::from_env()
+                .with_bucket_name(bucket)
+                .build()
+                .map_err(|error| Error::Source(format!("opening S3 source: {error}")))?,
+        ),
+        "gs" => Arc::new(
+            object_store::gcp::GoogleCloudStorageBuilder::from_env()
+                .with_bucket_name(bucket)
+                .build()
+                .map_err(|error| Error::Source(format!("opening GCS source: {error}")))?,
+        ),
+        "az" => Arc::new(
+            object_store::azure::MicrosoftAzureBuilder::from_env()
+                .with_container_name(bucket)
+                .build()
+                .map_err(|error| Error::Source(format!("opening Azure source: {error}")))?,
+        ),
+        other => {
+            return Err(Error::Source(format!(
+                "unsupported object-store scheme {other:?}; use s3://, gs:// or az://"
+            )))
+        }
+    };
+    let temp = tempfile::tempdir().map_err(|error| Error::Source(error.to_string()))?;
+    let root = temp.path().to_path_buf();
+    let prefix_path = ObjectPath::from(prefix.trim_matches('/'));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| Error::Source(format!("building object-store runtime: {error}")))?;
+    runtime.block_on(async {
+        let objects: Vec<_> = store
+            .list(Some(&prefix_path))
+            .try_collect()
+            .await
+            .map_err(|error| Error::Source(format!("listing {scheme} source: {error}")))?;
+        let keys: BTreeSet<String> = objects
+            .iter()
+            .map(|object| object.location.to_string())
+            .collect();
+        for object in &objects {
+            let key = object.location.to_string();
+            if !key.ends_with("/meta.json") && key != "meta.json" {
+                continue;
+            }
+            let bytes = store
+                .get(&object.location)
+                .await
+                .map_err(|error| Error::Source(format!("reading {key}: {error}")))?
+                .bytes()
+                .await
+                .map_err(|error| Error::Source(format!("reading {key}: {error}")))?;
+            let meta = match BlockMeta::parse(std::path::Path::new(&key), &bytes) {
+                Ok(meta) => meta,
+                Err(error) if options.on_error == OnError::Skip => {
+                    tracing::warn!(%key, %error, "skipping remote block with unreadable meta.json");
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if !options.block_ulids.is_empty() && !options.block_ulids.contains(&meta.ulid) {
+                continue;
+            }
+            if options
+                .min_time_ms
+                .is_some_and(|min| meta.max_time_ms <= min)
+                || options
+                    .max_time_ms
+                    .is_some_and(|max| meta.min_time_ms >= max)
+                || !downsample_wanted(meta.resolution(), options.downsampled)
+            {
+                continue;
+            }
+            let block_prefix = key.trim_end_matches("meta.json").trim_end_matches('/');
+            let block_dir = root.join(&meta.ulid);
+            std::fs::create_dir_all(block_dir.join("chunks"))
+                .map_err(|error| Error::Source(error.to_string()))?;
+            std::fs::write(block_dir.join("meta.json"), &bytes)
+                .map_err(|error| Error::Source(error.to_string()))?;
+            for (suffix, required) in [("index", true), ("tombstones", false)] {
+                let object_key = format!("{block_prefix}/{suffix}");
+                if keys.contains(&object_key) {
+                    let data = store
+                        .get(&ObjectPath::from(object_key.as_str()))
+                        .await
+                        .map_err(|error| Error::Source(format!("reading {object_key}: {error}")))?
+                        .bytes()
+                        .await
+                        .map_err(|error| Error::Source(format!("reading {object_key}: {error}")))?;
+                    std::fs::write(block_dir.join(suffix), data)
+                        .map_err(|error| Error::Source(error.to_string()))?;
+                } else if required {
+                    return Err(Error::Source(format!(
+                        "remote block {} has no index",
+                        meta.ulid
+                    )));
+                }
+            }
+            let chunk_prefix = format!("{block_prefix}/chunks/");
+            for chunk_key in keys.iter().filter(|key| key.starts_with(&chunk_prefix)) {
+                let name = chunk_key.strip_prefix(&chunk_prefix).unwrap_or("segment");
+                let data = store
+                    .get(&ObjectPath::from(chunk_key.as_str()))
+                    .await
+                    .map_err(|error| Error::Source(format!("reading {chunk_key}: {error}")))?
+                    .bytes()
+                    .await
+                    .map_err(|error| Error::Source(format!("reading {chunk_key}: {error}")))?;
+                std::fs::write(block_dir.join("chunks").join(name), data)
+                    .map_err(|error| Error::Source(error.to_string()))?;
+            }
+        }
+        Ok(())
+    })?;
+    Ok((root, temp))
 }
 
 fn downsample_wanted(resolution: i64, policy: DownsamplePolicy) -> bool {

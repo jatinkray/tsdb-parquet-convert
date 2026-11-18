@@ -59,8 +59,57 @@ impl FloatSample {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct OwnedHistogram {
+    pub timestamp_ms: i64,
+    pub count: f64,
+    pub zero_count: f64,
+    pub sum: f64,
+    pub schema: i32,
+    pub zero_threshold: f64,
+    pub pos_spans: Vec<tsdb_reader_upstream::Span>,
+    pub neg_spans: Vec<tsdb_reader_upstream::Span>,
+    pub pos_buckets: Vec<f64>,
+    pub neg_buckets: Vec<f64>,
+    pub custom_values: Vec<f64>,
+    pub reset_hint: u8,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChunkSamples {
     Floats(Vec<FloatSample>),
+    Histograms(Vec<OwnedHistogram>),
+}
+
+#[derive(Default)]
+struct DecodeSink {
+    floats: Vec<FloatSample>,
+    histograms: Vec<OwnedHistogram>,
+}
+
+impl tsdb_reader_upstream::SampleSink for DecodeSink {
+    fn push_float(&mut self, ts: i64, value: f64) {
+        self.floats.push(FloatSample {
+            timestamp_ms: ts,
+            value,
+        });
+    }
+
+    fn push_histogram(&mut self, histogram: &tsdb_reader_upstream::HistogramSample<'_>) {
+        self.histograms.push(OwnedHistogram {
+            timestamp_ms: histogram.ts,
+            count: histogram.count,
+            zero_count: histogram.zero_count,
+            sum: histogram.sum,
+            schema: histogram.schema,
+            zero_threshold: histogram.zero_threshold,
+            pos_spans: histogram.pos_spans.to_vec(),
+            neg_spans: histogram.neg_spans.to_vec(),
+            pos_buckets: histogram.pos_buckets.to_vec(),
+            neg_buckets: histogram.neg_buckets.to_vec(),
+            custom_values: histogram.custom_values.to_vec(),
+            reset_hint: histogram.reset_hint,
+        });
+    }
 }
 
 #[derive(Debug)]
@@ -132,12 +181,17 @@ impl ChunkReader {
             });
         }
 
-        match encoding {
-            Encoding::Xor => Ok((encoding, ChunkSamples::Floats(decode_xor(&path, &data)?))),
-            other => Err(Error::Unsupported {
-                path,
-                feature: format!("{} chunk decoding", other.name()),
-            }),
+        if encoding == Encoding::Xor {
+            return Ok((encoding, ChunkSamples::Floats(decode_xor(&path, &data)?)));
+        }
+        let mut sink = DecodeSink::default();
+        tsdb_reader_upstream::chunkenc::decode(encoding_byte[0], &data, &mut sink).map_err(
+            |error| Error::parse(&path, 0, format!("{} decode: {error}", encoding.name())),
+        )?;
+        if !sink.histograms.is_empty() {
+            Ok((encoding, ChunkSamples::Histograms(sink.histograms)))
+        } else {
+            Ok((encoding, ChunkSamples::Floats(sink.floats)))
         }
     }
 }

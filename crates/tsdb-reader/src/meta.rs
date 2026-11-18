@@ -66,8 +66,12 @@ impl BlockMeta {
     pub fn read(block_dir: &Path) -> Result<(Self, PathBuf)> {
         let path = block_dir.join("meta.json");
         let bytes = std::fs::read(&path).map_err(|e| Error::io(&path, e))?;
-        let meta: Self = serde_json::from_slice(&bytes)
-            .map_err(|e| Error::parse(&path, 0, format!("invalid meta.json: {e}")))?;
+        Ok((Self::parse(&path, &bytes)?, path))
+    }
+
+    pub fn parse(path: &Path, bytes: &[u8]) -> Result<Self> {
+        let meta: Self = serde_json::from_slice(bytes)
+            .map_err(|e| Error::parse(path, 0, format!("invalid meta.json: {e}")))?;
         if meta.ulid.trim().is_empty() {
             return Err(Error::Block {
                 ulid: meta.ulid,
@@ -83,7 +87,7 @@ impl BlockMeta {
                 ),
             });
         }
-        Ok((meta, path))
+        Ok(meta)
     }
 
     pub fn resolution(&self) -> i64 {
