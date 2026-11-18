@@ -1,0 +1,18 @@
+[package]
+name = "tsdb2parqtel"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+description = "Convert Prometheus/Thanos TSDB blocks into Parqtel-compatible Parquet blocks"
+
+[dependencies]
+clap = { workspace = true }
+tokio = { workspace = true }
+
+[[bin]]
+name = "tsdb2parqtel"
+path = "src/main.rs"
+
+[lints]
+workspace = true

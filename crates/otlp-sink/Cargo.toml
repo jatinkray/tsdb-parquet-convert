@@ -1,0 +1,13 @@
+[package]
+name = "otlp-sink"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+description = "OpenTelemetry to Parqtel metric conversion for live clones"
+
+[dependencies]
+parqtel-sink = { path = "../parqtel-sink" }
+
+[lints]
+workspace = true

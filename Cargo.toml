@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tsdb-reader",
+    "crates/parqtel-sink",
+    "crates/otlp-sink",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "Convert Prometheus/Thanos TSDB blocks into Parqtel-compatible Parquet blocks"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+arrow = { version = "60", features = ["ipc", "json", "csv", "prettyprint"] }
+parquet = { version = "60", features = ["zstd", "async", "encryption"] }
+arrow_array = { package = "arrow-array", version = "60" }
+arrow_schema = { package = "arrow-schema", version = "60" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+uuid = { version = "1", features = ["v4", "fast-rng"] }
+tempfile = "3"
+futures = "0.3"
+zstd = "0.14"
+ahash = "0.8"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"
+opt-level = 3
