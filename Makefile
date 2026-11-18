@@ -14,6 +14,7 @@ docs-check:
 	@test -f docs/DESIGN.md
 	@test -f docs/USAGE.md
 	@test -f docs/LIMITATIONS.md
+	@test -f docs/REPORT.md
 	@echo "documentation files present"
 
 build:

@@ -60,6 +60,8 @@ The exact audited Parqtel source and the docs/code discrepancies are recorded in
 [docs/DESIGN.md](docs/DESIGN.md). Known losses are in
 [docs/LIMITATIONS.md](docs/LIMITATIONS.md); native histograms are decoded but
 not converted because Parqtel has no schema-preserving native-histogram column.
+Commands, results and the measured 5.55M-sample run are in
+[docs/REPORT.md](docs/REPORT.md).
 
 ## Development
 
@@ -71,7 +73,8 @@ make docs-check
 ```
 
 The workspace pins `parqtel-core` by git revision and Arrow/Parquet 60.1.0.
-Changing either requires re-running the schema conformance test.
+Changing either requires re-running the schema conformance test. MSRV is Rust
+1.89 (the dependency set no longer builds on 1.88).
 
 ## License
 

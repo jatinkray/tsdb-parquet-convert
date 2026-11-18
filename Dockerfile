@@ -1,6 +1,6 @@
 # Build the converter in a pinned Rust image, then ship only the binary and CA
 # certificates. TLS is rustls-based; no OpenSSL runtime is required.
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.89-bookworm AS builder
 WORKDIR /src
 RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config cmake make g++ \

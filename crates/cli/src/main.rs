@@ -504,7 +504,11 @@ fn clone(args: CloneArgs, dry_run: bool) -> Result<i32> {
             target.display()
         );
     }
-    let options = build_convert_options(args.source, args.output, target.clone(), dry_run, true)?;
+    let mut output = args.output;
+    if output.target_retention_days.is_none() {
+        output.target_retention_days = read_target_retention(&target);
+    }
+    let options = build_convert_options(args.source, output, target.clone(), dry_run, true)?;
     let report = convert(&options)?;
     if !dry_run {
         install_index(&target, &report)?;
@@ -517,6 +521,35 @@ fn clone(args: CloneArgs, dry_run: bool) -> Result<i32> {
     } else {
         3
     })
+}
+
+fn read_target_retention(target: &Path) -> Option<u64> {
+    let candidates = [
+        target.join("parqtel.toml"),
+        target.join("config/default.toml"),
+        target
+            .parent()
+            .map(|parent| parent.join("parqtel.toml"))
+            .unwrap_or_default(),
+    ];
+    for path in candidates {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = text.parse::<toml::Value>() else {
+            continue;
+        };
+        if let Some(days) = value
+            .get("storage")
+            .and_then(|storage| storage.get("retention_days"))
+            .and_then(toml::Value::as_integer)
+            .and_then(|days| u64::try_from(days).ok())
+        {
+            tracing::info!(path = %path.display(), retention_days = days, "using target retention");
+            return Some(days);
+        }
+    }
+    None
 }
 
 fn wal_present(target: &Path) -> bool {

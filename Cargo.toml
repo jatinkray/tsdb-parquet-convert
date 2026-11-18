@@ -10,7 +10,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "Apache-2.0"
 description = "Convert Prometheus/Thanos TSDB blocks into Parqtel-compatible Parquet blocks"
 
@@ -44,6 +44,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 bytes = "1"
 object_store = { version = "0.14", features = ["aws", "gcp", "azure"] }
 tsdb-reader-upstream = { package = "tsdb-reader", version = "0.1.0", default-features = false }
+toml = "0.9"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
