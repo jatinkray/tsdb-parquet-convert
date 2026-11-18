@@ -26,13 +26,22 @@ thiserror = "1"
 anyhow = "1"
 tracing = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
-uuid = { version = "1", features = ["v4", "fast-rng"] }
+uuid = { version = "1", features = ["v4", "v5", "fast-rng"] }
 tempfile = "3"
 futures = "0.3"
 zstd = "0.14"
 ahash = "0.8"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+crc32c = "0.6"
+regex = "1"
+serde_yaml = "0.9"
+walkdir = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+rayon = "1"
+reqwest = { version = "0.12", features = ["json", "blocking", "rustls-tls"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+bytes = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

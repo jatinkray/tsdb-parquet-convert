@@ -7,12 +7,18 @@ license.workspace = true
 description = "Prometheus/Thanos TSDB block source abstractions"
 
 [dependencies]
-async-trait = { workspace = true }
+crc32c = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+walkdir = { workspace = true }
+parqtel-sink = { path = "../parqtel-sink" }
 
 [dev-dependencies]
-tokio = { workspace = true }
+proptest = "1"
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

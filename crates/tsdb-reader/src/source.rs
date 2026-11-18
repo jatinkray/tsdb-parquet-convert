@@ -1,0 +1,425 @@
+//! Local Prometheus/Thanos block sources.
+
+use crate::block::{Block, StaleMarkerPolicy};
+use crate::chunks::FloatSample;
+use crate::error::{Error, Result};
+use crate::index::Labels;
+use crate::matcher::Selector;
+use crate::meta::BlockMeta;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::PathBuf;
+use walkdir::WalkDir;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownsamplePolicy {
+    Skip,
+    PreferRaw,
+    Include,
+    Only,
+}
+
+impl DownsamplePolicy {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "skip" => Ok(Self::Skip),
+            "prefer-raw" => Ok(Self::PreferRaw),
+            "include" => Ok(Self::Include),
+            "only" => Ok(Self::Only),
+            other => Err(Error::Matcher(format!(
+                "downsampled must be skip, prefer-raw, include or only, got {other:?}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalLabels {
+    Include,
+    Ignore,
+}
+
+impl ExternalLabels {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "include" => Ok(Self::Include),
+            "ignore" => Ok(Self::Ignore),
+            other => Err(Error::Matcher(format!(
+                "external-labels must be include or ignore, got {other:?}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnError {
+    Skip,
+    Fail,
+}
+
+impl OnError {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "skip" => Ok(Self::Skip),
+            "fail" => Ok(Self::Fail),
+            other => Err(Error::Matcher(format!(
+                "on-error must be skip or fail, got {other:?}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceOptions {
+    pub root: PathBuf,
+    pub min_time_ms: Option<i64>,
+    pub max_time_ms: Option<i64>,
+    pub block_ulids: HashSet<String>,
+    pub matcher: Option<Selector>,
+    pub external_label_filter: Option<Selector>,
+    pub external_labels: ExternalLabels,
+    pub downsampled: DownsamplePolicy,
+    pub stale_markers: StaleMarkerPolicy,
+    pub dedup_replica_labels: Vec<String>,
+    pub on_error: OnError,
+}
+
+impl SourceOptions {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            min_time_ms: None,
+            max_time_ms: None,
+            block_ulids: HashSet::new(),
+            matcher: None,
+            external_label_filter: None,
+            external_labels: ExternalLabels::Include,
+            downsampled: DownsamplePolicy::PreferRaw,
+            stale_markers: StaleMarkerPolicy::Drop,
+            dedup_replica_labels: Vec::new(),
+            on_error: OnError::Fail,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockInfo {
+    pub dir: PathBuf,
+    pub meta: BlockMeta,
+    pub series: usize,
+    pub chunks: usize,
+    pub samples: u64,
+    pub resolution: i64,
+    pub external_labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ScanStats {
+    pub blocks: usize,
+    pub series: usize,
+    pub samples: u64,
+    pub skipped_blocks: usize,
+    pub skipped_series: usize,
+    pub stale_dropped: u64,
+    pub deleted_samples: u64,
+    pub errors: Vec<ErrorRecord>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ErrorRecord {
+    pub block_ulid: String,
+    pub series_id: Option<u64>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SeriesRecord {
+    pub block_ulid: String,
+    pub series_id: u64,
+    pub labels: Labels,
+    pub samples: Vec<FloatSample>,
+}
+
+impl SeriesRecord {
+    pub fn metric_name(&self) -> Option<&str> {
+        self.labels.get("__name__").map(String::as_str)
+    }
+}
+
+pub struct Source {
+    options: SourceOptions,
+    blocks: Vec<Block>,
+}
+
+impl Source {
+    pub fn open(options: SourceOptions) -> Result<Self> {
+        let mut dirs = Vec::new();
+        if options.root.join("meta.json").is_file() {
+            dirs.push(options.root.clone());
+        } else {
+            for entry in WalkDir::new(&options.root)
+                .max_depth(4)
+                .follow_links(false)
+                .into_iter()
+            {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        if options.on_error == OnError::Fail {
+                            return Err(Error::Source(format!(
+                                "walking {}: {error}",
+                                options.root.display()
+                            )));
+                        }
+                        tracing::warn!(root = %options.root.display(), %error, "skipping unreadable directory");
+                        continue;
+                    }
+                };
+                if entry.file_type().is_file() && entry.file_name() == "meta.json" {
+                    if let Some(parent) = entry.path().parent() {
+                        dirs.push(parent.to_path_buf());
+                    }
+                }
+            }
+        }
+        dirs.sort();
+        dirs.dedup();
+
+        let mut blocks = Vec::new();
+        for dir in dirs {
+            let meta = match BlockMeta::read(&dir) {
+                Ok((meta, _)) => meta,
+                Err(error) if options.on_error == OnError::Skip => {
+                    tracing::warn!(block = %dir.display(), %error, "skipping block with unreadable meta.json");
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if !options.block_ulids.is_empty() && !options.block_ulids.contains(&meta.ulid) {
+                continue;
+            }
+            if options
+                .min_time_ms
+                .is_some_and(|min| meta.max_time_ms <= min)
+                || options
+                    .max_time_ms
+                    .is_some_and(|max| meta.min_time_ms >= max)
+            {
+                continue;
+            }
+            if !downsample_wanted(meta.resolution(), options.downsampled) {
+                continue;
+            }
+            if let Some(filter) = &options.external_label_filter {
+                if !filter.matches(meta.external_labels()) {
+                    continue;
+                }
+            }
+            match Block::open(&dir) {
+                Ok(block) => blocks.push(block),
+                Err(error) if options.on_error == OnError::Skip => {
+                    tracing::warn!(block = %dir.display(), %error, "skipping unreadable block");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if blocks.is_empty() {
+            return Err(Error::EmptySource(options.root));
+        }
+        if options.downsampled == DownsamplePolicy::PreferRaw {
+            blocks = prefer_raw(blocks);
+        }
+        blocks.sort_by_key(|block| (block.meta.min_time_ms, block.meta.ulid.clone()));
+        Ok(Self { options, blocks })
+    }
+
+    pub fn block_infos(&self) -> Vec<BlockInfo> {
+        self.blocks
+            .iter()
+            .map(|block| BlockInfo {
+                dir: block.dir.clone(),
+                meta: block.meta.clone(),
+                series: block.series().len(),
+                chunks: block
+                    .series()
+                    .iter()
+                    .map(|series| series.chunks.len())
+                    .sum(),
+                samples: block.meta.stats.num_samples,
+                resolution: block.meta.resolution(),
+                external_labels: block.meta.external_labels().clone(),
+            })
+            .collect()
+    }
+
+    pub fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub fn scan<F>(&self, mut emit: F) -> Result<ScanStats>
+    where
+        F: FnMut(SeriesRecord) -> Result<()>,
+    {
+        let mut stats = ScanStats {
+            blocks: self.blocks.len(),
+            ..ScanStats::default()
+        };
+        let min_time = self.options.min_time_ms.unwrap_or(i64::MIN);
+        let max_time = self.options.max_time_ms.unwrap_or(i64::MAX);
+        let mut buffered: Option<BTreeMap<Labels, Vec<SeriesRecord>>> = None;
+        if !self.options.dedup_replica_labels.is_empty() {
+            buffered = Some(BTreeMap::new());
+        }
+
+        for block in &self.blocks {
+            for series in block.series() {
+                let Some(metric_name) = series.metric_name() else {
+                    stats.skipped_series += 1;
+                    continue;
+                };
+                if metric_name.is_empty() {
+                    stats.skipped_series += 1;
+                    continue;
+                }
+                let mut labels = series.labels.clone();
+                if self.options.external_labels == ExternalLabels::Include {
+                    for (key, value) in block.meta.external_labels() {
+                        labels.insert(key.clone(), value.clone());
+                    }
+                }
+                if self
+                    .options
+                    .matcher
+                    .as_ref()
+                    .is_some_and(|matcher| !matcher.matches(&labels))
+                {
+                    stats.skipped_series += 1;
+                    continue;
+                }
+                let samples =
+                    match block.read_series(series, min_time, max_time, self.options.stale_markers)
+                    {
+                        Ok(samples) => samples,
+                        Err(error) if self.options.on_error == OnError::Skip => {
+                            stats.errors.push(ErrorRecord {
+                                block_ulid: block.ulid().to_string(),
+                                series_id: Some(series.id),
+                                message: error.to_string(),
+                            });
+                            stats.skipped_series += 1;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                let before = samples.len();
+                let samples: Vec<FloatSample> = samples
+                    .into_iter()
+                    .filter(|sample| {
+                        sample.timestamp_ms >= min_time
+                            && sample.timestamp_ms < max_time
+                            && (self.options.stale_markers == StaleMarkerPolicy::Keep
+                                || !sample.is_stale_marker())
+                    })
+                    .collect();
+                stats.stale_dropped += (before - samples.len()) as u64;
+                stats.deleted_samples += block.deleted_intervals(series).len() as u64;
+                if samples.is_empty() {
+                    stats.skipped_series += 1;
+                    continue;
+                }
+                stats.series += 1;
+                stats.samples += samples.len() as u64;
+                let record = SeriesRecord {
+                    block_ulid: block.ulid().to_string(),
+                    series_id: series.id,
+                    labels,
+                    samples,
+                };
+                if let Some(buffer) = &mut buffered {
+                    let key = dedup_key(&record.labels, &self.options.dedup_replica_labels);
+                    buffer.entry(key).or_default().push(record);
+                } else {
+                    emit(record)?;
+                }
+            }
+        }
+
+        if let Some(buffer) = buffered {
+            for (_, mut records) in buffer {
+                let winner = |a: &SeriesRecord, b: &SeriesRecord| {
+                    (a.block_ulid.clone(), a.series_id).cmp(&(b.block_ulid.clone(), b.series_id))
+                };
+                records.sort_by(winner);
+                let labels = records
+                    .first()
+                    .map(|record| record.labels.clone())
+                    .unwrap_or_default();
+                let mut by_time: BTreeMap<i64, (String, u64, f64)> = BTreeMap::new();
+                for record in records {
+                    for sample in record.samples {
+                        by_time.entry(sample.timestamp_ms).or_insert((
+                            record.block_ulid.clone(),
+                            record.series_id,
+                            sample.value,
+                        ));
+                    }
+                }
+                let samples = by_time
+                    .into_iter()
+                    .map(|(timestamp_ms, (_, _, value))| FloatSample {
+                        timestamp_ms,
+                        value,
+                    })
+                    .collect();
+                emit(SeriesRecord {
+                    block_ulid: String::new(),
+                    series_id: 0,
+                    labels,
+                    samples,
+                })?;
+            }
+        }
+        Ok(stats)
+    }
+}
+
+fn downsample_wanted(resolution: i64, policy: DownsamplePolicy) -> bool {
+    match policy {
+        DownsamplePolicy::Skip => resolution == 0,
+        DownsamplePolicy::Only => resolution > 0,
+        DownsamplePolicy::Include | DownsamplePolicy::PreferRaw => true,
+    }
+}
+
+fn prefer_raw(blocks: Vec<Block>) -> Vec<Block> {
+    let raw: Vec<(i64, i64)> = blocks
+        .iter()
+        .filter(|block| block.meta.resolution() == 0)
+        .map(|block| (block.meta.min_time_ms, block.meta.max_time_ms))
+        .collect();
+    blocks
+        .into_iter()
+        .filter(|block| {
+            if block.meta.resolution() == 0 {
+                return true;
+            }
+            !raw.iter()
+                .any(|(min, max)| *min <= block.meta.min_time_ms && *max >= block.meta.max_time_ms)
+        })
+        .collect()
+}
+
+fn dedup_key(labels: &Labels, replica_labels: &[String]) -> Labels {
+    labels
+        .iter()
+        .filter(|(key, _)| !replica_labels.iter().any(|replica| replica == *key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// Fills a `BTreeSet` of every label name encountered by a source.
+pub fn label_names(records: &[SeriesRecord]) -> BTreeSet<String> {
+    records
+        .iter()
+        .flat_map(|record| record.labels.keys().cloned())
+        .collect()
+}

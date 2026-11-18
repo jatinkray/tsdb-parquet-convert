@@ -8,6 +8,16 @@ description = "OpenTelemetry to Parqtel metric conversion for live clones"
 
 [dependencies]
 parqtel-sink = { path = "../parqtel-sink" }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
