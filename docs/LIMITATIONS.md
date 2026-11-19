@@ -101,3 +101,13 @@ semantics.
 - **Live mode queries 1 µs after the source timestamp.** Parqtel parses `time`
   as f64 seconds; at 2022 epochs an exact boundary can evaluate a few hundred
   nanoseconds early and miss the row.
+
+## Reader implementation
+
+- **Full index scan.** The reader parses the TOC, symbol table and series
+  entries; it does not use postings or label indexes to narrow a selector.
+  `--matcher` is applied after series labels are decoded. This is a performance
+  choice, not a correctness difference.
+- **Bounded file reads, not mmap.** Chunk records are read with checked
+  `Read`/`Seek` calls. The process therefore never has to keep a whole segment
+  mapped, at the cost of one read syscall per chunk.
