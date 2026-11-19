@@ -87,6 +87,17 @@ echo "== otlp checkpoint resume =="
   --matcher '{__name__="up"}'
 verify_live --matcher '{__name__="up"}'
 
+echo "== otlp protobuf =="
+"${COMPOSE[@]}" down -v --remove-orphans >/dev/null
+"${COMPOSE[@]}" up -d
+wait_ready
+"$CONVERTER" clone "$FIXTURE" \
+  --target "$BASE_URL" \
+  --checkpoint "$WORK/checkpoint-protobuf.json" \
+  --otlp-protocol protobuf \
+  --matcher '{__name__="up"}'
+verify_live --matcher '{__name__="up"}'
+
 echo "== compaction =="
 "${COMPOSE[@]}" stop parqtel >/dev/null
 "${COMPOSE[@]}" run --rm parqtel compact

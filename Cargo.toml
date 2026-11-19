@@ -43,6 +43,8 @@ reqwest = { version = "0.12", features = ["json", "blocking", "rustls-tls"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 bytes = "1"
 object_store = { version = "0.14", features = ["aws", "gcp", "azure"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "metrics"] }
+prost = "0.14"
 tsdb-reader-upstream = { package = "tsdb-reader", version = "0.1.0", default-features = false }
 toml = "0.9"
 

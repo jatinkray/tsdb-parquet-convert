@@ -66,10 +66,9 @@ semantics.
 
 ## Live clone
 
-- **HTTP/JSON only.** The live sink uses Parqtel's `/v1/metrics/json`
-  endpoint. Protobuf and gRPC OTLP paths are decoded by Parqtel but are not
-  implemented by this tool yet; the JSON path preserves finite values exactly
-  and is check-pointed per series.
+- **HTTP only.** The live sink supports OTLP/HTTP JSON and protobuf. OTLP/gRPC
+  is not implemented; use the HTTP endpoint. Both transports checkpoint per
+  series and preserve finite values exactly.
 
 ## Installation / visibility
 

@@ -28,6 +28,7 @@
 | files e2e | `scripts/e2e.sh` (real Parqtel container, restart adoption) | 34,410 series / 140,718 samples in window, 0 mismatch; 716 NaN payloads normalized by live JSON |
 | OTLP e2e | same script, `/v1/metrics/json` | 23 series / 3,985 samples imported, 0 retry, live reconcile 0 mismatch |
 | OTLP resume | re-run same checkpoint | 0 requests, 3,985 samples skipped, reconcile still 0 mismatch |
+| OTLP protobuf e2e | same script, `--otlp-protocol protobuf` `/v1/metrics` | 23 series / 3,985 samples imported, live reconcile 0 mismatch |
 | compaction e2e | `parqtel compact` then reconcile | 0 blocks compacted (single window), reconcile 0 mismatch |
 | retention refusal | `plan <fixture> --target-retention-days 1 --retention-action refuse` | exit 5, exact `storage.retention_days` warning |
 | dry run | `--dry-run convert <fixture> --out /tmp/...` | exit 0, output directory not created |

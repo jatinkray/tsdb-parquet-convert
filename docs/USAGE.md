@@ -92,10 +92,11 @@ tsdb2parqtel clone /var/lib/thanos/bucket/prod \
   --checkpoint /var/lib/parqtel/clones/prod.json
 ```
 
-The sink sends OTLP/HTTP JSON to `/v1/metrics/json`, keeps each body under 4 MiB,
-splits a series into timestamp-ordered batches, retries `429`/`5xx`/timeouts
-with jittered backoff, and checkpoints the last acknowledged timestamp per
-series. Re-running resumes after that timestamp.
+The sink sends OTLP/HTTP JSON to `/v1/metrics/json` by default, or protobuf to
+`/v1/metrics` with `--otlp-protocol protobuf`. It keeps each body under 4 MiB,
+splits a series into timestamp-ordered batches, splits again on `413`, retries
+`429`/`5xx`/timeouts with jittered backoff, and checkpoints the last acknowledged
+timestamp per series. Re-running resumes after that timestamp.
 
 Verify a live instance (one instant query per source sample; slow but exact):
 

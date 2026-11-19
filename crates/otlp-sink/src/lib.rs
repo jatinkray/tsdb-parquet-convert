@@ -1,15 +1,22 @@
-//! OTLP/HTTP JSON live clone.
+//! OTLP/HTTP live clone (JSON or protobuf).
 //!
-//! Parqtel accepts OTLP JSON at `/v1/metrics/json`. We deliberately send JSON
-//! rather than protobuf here: the wire shape is inspectable, the body limit is
-//! easy to enforce, and the target endpoint is the same ingest path the server
-//! already documents. The sink keeps request bodies under `max_body_bytes`
-//! (default 4 MiB), retries transient failures with jitter, and checkpoints the
-//! last acknowledged timestamp per series.
+//! JSON goes to `/v1/metrics/json`; protobuf goes to `/v1/metrics` with
+//! `application/x-protobuf`. The sink keeps request bodies under
+//! `max_body_bytes` (default 4 MiB), splits on `413`, retries transient
+//! failures with jitter, and checkpoints the last acknowledged timestamp per
+//! series.
 
 #![deny(unsafe_code)]
 
 use anyhow::{Context, Result};
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
+use opentelemetry_proto::tonic::metrics::v1::{
+    metric::Data as MetricData, number_data_point::Value as NumberValue, Gauge, Metric,
+    NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
+};
+use opentelemetry_proto::tonic::resource::v1::Resource;
+use prost::Message as ProstMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -24,11 +31,35 @@ pub enum MetricKind {
     Sum,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Json,
+    Protobuf,
+}
+
+impl Protocol {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "json" => Ok(Self::Json),
+            "protobuf" => Ok(Self::Protobuf),
+            other => anyhow::bail!("OTLP protocol must be json or protobuf, got {other:?}"),
+        }
+    }
+
+    fn content_type(self) -> &'static str {
+        match self {
+            Self::Json => "application/json",
+            Self::Protobuf => "application/x-protobuf",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OtlpSink {
     endpoint: String,
     client: reqwest::blocking::Client,
     max_body_bytes: usize,
+    protocol: Protocol,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -91,7 +122,11 @@ enum PostFailure {
 
 impl OtlpSink {
     pub fn new(endpoint: &str) -> Result<Self> {
-        let endpoint = normalize_endpoint(endpoint);
+        Self::with_protocol(endpoint, Protocol::Json)
+    }
+
+    pub fn with_protocol(endpoint: &str, protocol: Protocol) -> Result<Self> {
+        let endpoint = normalize_endpoint(endpoint, protocol);
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(60))
             .build()
@@ -100,6 +135,7 @@ impl OtlpSink {
             endpoint,
             client,
             max_body_bytes: DEFAULT_MAX_BODY,
+            protocol,
         })
     }
 
@@ -145,7 +181,7 @@ impl OtlpSink {
                 continue;
             }
             loop {
-                let body = build_body(metric, kind, labels, resource, &batch)?;
+                let body = build_body(metric, kind, labels, resource, &batch, self.protocol)?;
                 if body.len() > self.max_body_bytes && batch.len() > 1 {
                     let keep = (batch.len() / 2).max(1);
                     batch.truncate(keep);
@@ -197,7 +233,7 @@ impl OtlpSink {
             let response = self
                 .client
                 .post(&self.endpoint)
-                .header("Content-Type", "application/json")
+                .header("Content-Type", self.protocol.content_type())
                 .body(body.to_vec())
                 .send();
             match response {
@@ -246,11 +282,14 @@ impl OtlpSink {
     }
 }
 
-fn normalize_endpoint(endpoint: &str) -> String {
-    if endpoint.ends_with("/v1/metrics/json") {
-        endpoint.to_string()
-    } else {
-        format!("{}/v1/metrics/json", endpoint.trim_end_matches('/'))
+fn normalize_endpoint(endpoint: &str, protocol: Protocol) -> String {
+    let base = endpoint
+        .trim_end_matches('/')
+        .trim_end_matches("/v1/metrics/json")
+        .trim_end_matches("/v1/metrics");
+    match protocol {
+        Protocol::Json => format!("{base}/v1/metrics/json"),
+        Protocol::Protobuf => format!("{base}/v1/metrics"),
     }
 }
 
@@ -260,6 +299,7 @@ fn build_body(
     labels: &BTreeMap<String, String>,
     resource: &BTreeMap<String, String>,
     samples: &[(i64, f64)],
+    protocol: Protocol,
 ) -> Result<Vec<u8>> {
     let data_points: Vec<_> = samples
         .iter()
@@ -285,6 +325,59 @@ fn build_body(
             }
         }),
     };
+    if protocol == Protocol::Protobuf {
+        let data = match kind {
+            MetricKind::Gauge => MetricData::Gauge(Gauge {
+                data_points: samples
+                    .iter()
+                    .map(|(timestamp_ns, value)| NumberDataPoint {
+                        attributes: proto_attributes(labels),
+                        start_time_unix_nano: 0,
+                        time_unix_nano: *timestamp_ns as u64,
+                        exemplars: Vec::new(),
+                        flags: 0,
+                        value: Some(NumberValue::AsDouble(*value)),
+                    })
+                    .collect(),
+            }),
+            MetricKind::Sum => MetricData::Sum(Sum {
+                data_points: samples
+                    .iter()
+                    .map(|(timestamp_ns, value)| NumberDataPoint {
+                        attributes: proto_attributes(labels),
+                        start_time_unix_nano: 0,
+                        time_unix_nano: *timestamp_ns as u64,
+                        exemplars: Vec::new(),
+                        flags: 0,
+                        value: Some(NumberValue::AsDouble(*value)),
+                    })
+                    .collect(),
+                aggregation_temporality: 2,
+                is_monotonic: true,
+            }),
+        };
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: proto_attributes(resource),
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![Metric {
+                        name: metric.to_string(),
+                        description: String::new(),
+                        unit: String::new(),
+                        metadata: Vec::new(),
+                        data: Some(data),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        return Ok(request.encode_to_vec());
+    }
     let body = json!({
         "resourceMetrics": [{
             "resource": { "attributes": attributes(resource) },
@@ -292,6 +385,19 @@ fn build_body(
         }]
     });
     serde_json::to_vec(&body).context("serialising OTLP request")
+}
+
+fn proto_attributes(labels: &BTreeMap<String, String>) -> Vec<KeyValue> {
+    labels
+        .iter()
+        .map(|(key, value)| KeyValue {
+            key: key.clone(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(value.clone())),
+            }),
+            ..Default::default()
+        })
+        .collect()
 }
 
 fn attributes(labels: &BTreeMap<String, String>) -> Vec<serde_json::Value> {
@@ -321,26 +427,63 @@ mod tests {
     #[test]
     fn normalizes_endpoint() {
         assert_eq!(
-            normalize_endpoint("http://localhost:8080"),
+            normalize_endpoint("http://localhost:8080", Protocol::Json),
             "http://localhost:8080/v1/metrics/json"
         );
         assert_eq!(
-            normalize_endpoint("http://localhost:8080/v1/metrics/json"),
+            normalize_endpoint("http://localhost:8080/v1/metrics/json", Protocol::Json),
             "http://localhost:8080/v1/metrics/json"
         );
+        assert_eq!(
+            normalize_endpoint("http://localhost:8080", Protocol::Protobuf),
+            "http://localhost:8080/v1/metrics"
+        );
+    }
+
+    #[test]
+    fn builds_protobuf_gauge_and_sum() {
+        let labels = BTreeMap::from([("job".to_string(), "api".to_string())]);
+        let resource = BTreeMap::from([("service.name".to_string(), "api".to_string())]);
+        let bytes = build_body(
+            "up",
+            MetricKind::Gauge,
+            &labels,
+            &resource,
+            &[(1, 1.0)],
+            Protocol::Protobuf,
+        )
+        .unwrap();
+        let request = ExportMetricsServiceRequest::decode(bytes.as_slice()).unwrap();
+        let resource = &request.resource_metrics[0];
+        assert_eq!(
+            resource.resource.as_ref().unwrap().attributes[0].key,
+            "service.name"
+        );
+        let metric = &resource.scope_metrics[0].metrics[0];
+        assert_eq!(metric.name, "up");
+        assert!(matches!(metric.data, Some(MetricData::Gauge(_))));
     }
 
     #[test]
     fn builds_otlp_gauge_and_sum() {
         let labels = BTreeMap::from([("job".to_string(), "api".to_string())]);
         let resource = BTreeMap::from([("service.name".to_string(), "api".to_string())]);
-        let gauge = build_body("up", MetricKind::Gauge, &labels, &resource, &[(1, 1.0)]).unwrap();
+        let gauge = build_body(
+            "up",
+            MetricKind::Gauge,
+            &labels,
+            &resource,
+            &[(1, 1.0)],
+            Protocol::Json,
+        )
+        .unwrap();
         let sum = build_body(
             "requests_total",
             MetricKind::Sum,
             &labels,
             &resource,
             &[(1, 2.0)],
+            Protocol::Json,
         )
         .unwrap();
         assert!(std::str::from_utf8(&gauge).unwrap().contains("\"gauge\""));

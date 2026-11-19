@@ -219,6 +219,8 @@ struct CloneArgs {
     output: OutputArgs,
     #[arg(long, help = "Checkpoint file for resumable OTLP replay")]
     checkpoint: Option<PathBuf>,
+    #[arg(long, default_value = "json", value_parser = ["json", "protobuf"])]
+    otlp_protocol: String,
     #[arg(long, help = "Install the index even when a WAL is present")]
     force: bool,
 }
@@ -645,7 +647,8 @@ fn clone_otlp(args: CloneArgs, dry_run: bool) -> Result<i32> {
         .checkpoint
         .unwrap_or_else(|| PathBuf::from("tsdb2parqtel-checkpoint.json"));
     let mut checkpoint = otlp_sink::Checkpoint::load(&checkpoint_path)?;
-    let sink = otlp_sink::OtlpSink::new(&args.target)?;
+    let protocol = otlp_sink::Protocol::parse(&args.otlp_protocol)?;
+    let sink = otlp_sink::OtlpSink::with_protocol(&args.target, protocol)?;
     let mut totals = otlp_sink::CloneStats::default();
     source.scan(|record| {
         let Some(metric) = record.metric_name().map(str::to_string) else {
