@@ -273,7 +273,41 @@ impl Source {
         self.blocks.len()
     }
 
-    pub fn scan<F>(&self, mut emit: F) -> Result<ScanStats>
+    /// Inclusive time bounds of the selected blocks, clipped by the source
+    /// options. A block's `maxTime` is exclusive, so this returns `max - 1`.
+    pub fn time_bounds_ms(&self) -> Option<(i64, i64)> {
+        let mut min = i64::MAX;
+        let mut max = i64::MIN;
+        for block in &self.blocks {
+            min = min.min(block.meta.min_time_ms);
+            max = max.max(block.meta.max_time_ms.saturating_sub(1));
+        }
+        if min == i64::MAX {
+            return None;
+        }
+        let min = self.options.min_time_ms.map_or(min, |bound| min.max(bound));
+        let max = self
+            .options
+            .max_time_ms
+            .map_or(max, |bound| max.min(bound.saturating_sub(1)));
+        (min <= max).then_some((min, max))
+    }
+
+    pub fn scan<F>(&self, emit: F) -> Result<ScanStats>
+    where
+        F: FnMut(SeriesRecord) -> Result<()>,
+    {
+        self.scan_range(
+            self.options.min_time_ms.unwrap_or(i64::MIN),
+            self.options.max_time_ms.unwrap_or(i64::MAX),
+            emit,
+        )
+    }
+
+    /// Scans only samples in `[min_time_ms, max_time_ms)`. Converters call this
+    /// once per output window so window state is bounded by one window rather
+    /// than by the whole source.
+    pub fn scan_range<F>(&self, min_time: i64, max_time: i64, mut emit: F) -> Result<ScanStats>
     where
         F: FnMut(SeriesRecord) -> Result<()>,
     {
@@ -281,8 +315,6 @@ impl Source {
             blocks: self.blocks.len(),
             ..ScanStats::default()
         };
-        let min_time = self.options.min_time_ms.unwrap_or(i64::MIN);
-        let max_time = self.options.max_time_ms.unwrap_or(i64::MAX);
         let mut buffered: Option<BTreeMap<Labels, Vec<SeriesRecord>>> = None;
         if !self.options.dedup_replica_labels.is_empty() {
             buffered = Some(BTreeMap::new());
@@ -367,6 +399,10 @@ impl Source {
                     (a.block_ulid.clone(), a.series_id).cmp(&(b.block_ulid.clone(), b.series_id))
                 };
                 records.sort_by(winner);
+                let source_block = records
+                    .first()
+                    .map(|record| record.block_ulid.clone())
+                    .unwrap_or_default();
                 let mut labels = records
                     .first()
                     .map(|record| record.labels.clone())
@@ -396,7 +432,7 @@ impl Source {
                     })
                     .collect();
                 emit(SeriesRecord {
-                    block_ulid: String::new(),
+                    block_ulid: source_block,
                     series_id: 0,
                     labels,
                     samples,

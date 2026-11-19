@@ -39,7 +39,11 @@ Source: `crates/parqtel-core/src/models/storage/schema.rs`,
 - Parquet writer version `PARQUET_2_0`.
 - Compression `zstd` (level 1–22), `snappy`, `lz4` or `none`.
 - Row group size 100 000 (must be ≤ max rows per block).
-- Bloom filters on `metric_name` and `service_name`, fpp `0.01`.
+- Bloom filters are configured for `metric_name` and `service_name`, fpp
+  `0.01`. The upstream builder then calls the global `set_bloom_filter_fpp`,
+  which implicitly enables a filter on **every** column; the converter keeps
+  that exact behavior for byte-compatible output. This is an upstream
+  discrepancy between the stated intent and the emitted block.
 - Page statistics, column-index truncate length 64, data page limit 512 KiB.
 - No dictionary for the log `body` column; metric columns use dictionary
   encoding as normally inferred by Arrow.
@@ -167,6 +171,16 @@ raw block covers its entire range.
   alert engine derives it from transition history.
 - Parqtel docs mention an index lock/WAL check for live installs; this tool
   implements a WAL-presence guard, not a process lock. Restart is required.
+- Parqtel's writer comment says bloom filters are per-column for
+  `metric_name`/`service_name`, but the global `set_bloom_filter_fpp` call
+  enables bloom filters on every column. Conformance tests assert this
+  upstream behavior rather than the comment.
+
+- Parqtel's instant-query API parses `time` as floating-point seconds. At
+  2022-era epochs, f64 cannot represent every nanosecond, so a query exactly on
+  a stored sample can evaluate a few hundred nanoseconds before the row and
+  miss it. `verify` evaluates 1 µs after the source timestamp and documents the
+  workaround; this is a query-parser precision issue, not a storage loss.
 
 ## 8. Assumptions
 
@@ -179,3 +193,15 @@ raw block covers its entire range.
   checked multiplication. Instants older than the target retention are warned
   about (or refused when `--retention-action refuse`).
 - The tool never writes to the source.
+
+
+## 9. Streaming and memory bound
+
+`Source::scan_range(start_ms, end_ms)` applies the source selection and reads
+only chunks overlapping the requested range. `convert` builds the output window
+ranges, scans each window, writes it (splitting at `max_rows_per_block`), and
+then drops the window state. Independent windows run on Rayon with
+`--threads`; peak memory is bounded by the number of concurrent windows, not by
+the total source size. On the 100M-sample synthetic block, eight concurrent 1M
+row windows peaked at 1.09 GiB and ran at ≈15.3M samples/s; `--threads 1` used
+109 MiB.

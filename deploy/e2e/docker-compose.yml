@@ -1,0 +1,26 @@
+services:
+  parqtel:
+    image: ${PARQTEL_IMAGE:-ghcr.io/parqtel/parqtel-oss:0.3.1}
+    command: ["serve"]
+    ports:
+      - "18080:8080"
+      - "14317:4317"
+    environment:
+      PARQTEL_BIND: 0.0.0.0:8080
+      PARQTEL_DATA_DIR: /data
+      PARQTEL__STORAGE__DATA_DIR: /data
+      PARQTEL__STORAGE__BLOCK_DURATION_SECS: "7200"
+      PARQTEL__STORAGE__RETENTION_DAYS: "3650"
+      PARQTEL__INGEST__WAL_ENABLED: "false"
+      RUST_LOG: info
+    volumes:
+      - parqtel_e2e:/data
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+
+volumes:
+  parqtel_e2e:

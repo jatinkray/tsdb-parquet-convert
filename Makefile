@@ -1,4 +1,4 @@
-.PHONY: fmt test lint docs-check build release docker
+.PHONY: fmt test lint docs-check build release docker e2e
 
 fmt:
 	cargo fmt --all -- --check
@@ -25,3 +25,6 @@ release:
 
 docker:
 	docker build -t tsdb2parqtel:local .
+
+e2e:
+	bash scripts/e2e.sh

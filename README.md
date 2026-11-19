@@ -21,7 +21,8 @@ cargo build --release
   labels; supports replica dedup and downsample selection.
 - Writes blocks through the pinned `parqtel-core` writer, so the Arrow schema,
   footer series table and Parquet writer properties match the server exactly.
-- Streams one series at a time; windows are bounded by `--max-rows-per-block`.
+- Scans one output window at a time and flushes at
+  `--max-rows-per-block`, so peak memory is independent of total source size.
 - Uses deterministic UUIDv5 filenames, so a re-run overwrites the same block
   names instead of duplicating samples.
 - Produces `index.fragment.json`, installs into a stopped data directory with

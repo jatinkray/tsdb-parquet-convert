@@ -7,6 +7,7 @@ use parqtel_sink::{
     write_metric_block, write_sidecar_fragment, BlockFile, BlockSpec, DataPoint, LabelSet,
     MetricKind, MetricValue, SeriesData, WriterConfig,
 };
+use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tsdb_reader::{ScanStats, SeriesRecord, Source, SourceOptions};
@@ -24,6 +25,7 @@ pub struct ConvertOptions {
     pub dry_run: bool,
     pub target_retention_days: Option<u64>,
     pub retention_refuse: bool,
+    pub progress: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -96,31 +98,58 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertReport> {
         .and_then(|seconds| seconds.checked_mul(1_000_000_000))
         .context("block-duration-secs is too large")?;
     let source = Source::open(options.source.clone())?;
-    let mut windows: BTreeMap<WindowKey, WindowState> = BTreeMap::new();
-    let mut next_parts: BTreeMap<WindowKey, u32> = BTreeMap::new();
-    let mut report = ConvertReport::default();
+    let (min_ms, max_ms) = source
+        .time_bounds_ms()
+        .context("source selection has no samples in range")?;
     if !options.dry_run {
         std::fs::create_dir_all(&options.out_dir)
             .with_context(|| format!("creating output directory {}", options.out_dir.display()))?;
     }
 
-    let stats = source.scan(|record| {
-        append_record(
-            options,
-            window_ns,
-            record,
-            &mut windows,
-            &mut next_parts,
-            &mut report,
-        )
-        .map_err(|error| tsdb_reader::Error::Source(error.to_string()))
-    })?;
-    report.stats = stats;
-
-    let keys: Vec<WindowKey> = windows.keys().cloned().collect();
-    for key in keys {
-        flush_window(options, &key, &mut windows, &mut next_parts, &mut report)?;
+    let window_ms = i64::try_from(options.block_duration_secs)
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000))
+        .context("block-duration-secs is too large")?;
+    let first_window_ms = min_ms.div_euclid(window_ms) * window_ms;
+    let mut ranges = Vec::new();
+    let mut window_start_ms = first_window_ms;
+    while window_start_ms <= max_ms {
+        let window_end_ms = window_start_ms
+            .checked_add(window_ms)
+            .context("output window end overflow")?;
+        ranges.push((window_start_ms, window_end_ms.min(max_ms.saturating_add(1))));
+        window_start_ms = window_end_ms;
     }
+
+    let mut report = ConvertReport {
+        stats: ScanStats {
+            blocks: source.block_count(),
+            ..ScanStats::default()
+        },
+        ..ConvertReport::default()
+    };
+    let parallel = ranges.len() > 1 && rayon::current_num_threads() > 1;
+    if parallel {
+        let parts: Vec<ConvertReport> = ranges
+            .par_iter()
+            .map(|(start, end)| convert_one_window(options, &source, window_ns, *start, *end))
+            .collect::<Result<Vec<_>>>()?;
+        for part in parts {
+            merge_report(&mut report, part);
+        }
+    } else {
+        for (start, end) in ranges {
+            let part = convert_one_window(options, &source, window_ns, start, end)?;
+            merge_report(&mut report, part);
+        }
+    }
+    report.windows.sort_by(|a, b| {
+        (a.start_ns, &a.block_ulid, a.parts).cmp(&(b.start_ns, &b.block_ulid, b.parts))
+    });
+    report.blocks.sort_by(|a, b| a.filename.cmp(&b.filename));
+    report.preview.sort();
+    report.preview.truncate(10);
+    report.stats.blocks = source.block_count();
 
     if options.write_sidecar && !report.blocks.is_empty() {
         let metadata: Vec<_> = report
@@ -147,6 +176,61 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertReport> {
         }
     }
     Ok(report)
+}
+
+fn convert_one_window(
+    options: &ConvertOptions,
+    source: &Source,
+    window_ns: i64,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<ConvertReport> {
+    let mut windows: BTreeMap<WindowKey, WindowState> = BTreeMap::new();
+    let mut next_parts: BTreeMap<WindowKey, u32> = BTreeMap::new();
+    let mut report = ConvertReport::default();
+    report.stats = source.scan_range(start_ms, end_ms, |record| {
+        append_record(
+            options,
+            window_ns,
+            record,
+            &mut windows,
+            &mut next_parts,
+            &mut report,
+        )
+        .map_err(|error| tsdb_reader::Error::Source(error.to_string()))
+    })?;
+    let keys: Vec<WindowKey> = windows.keys().cloned().collect();
+    for key in keys {
+        flush_window(options, &key, &mut windows, &mut next_parts, &mut report)?;
+    }
+    if options.progress {
+        tracing::info!(
+            start_ms,
+            end_ms,
+            rows = report.total_rows,
+            blocks = report.blocks.len(),
+            "window converted"
+        );
+    }
+    Ok(report)
+}
+
+fn merge_report(total: &mut ConvertReport, mut part: ConvertReport) {
+    merge_stats(&mut total.stats, part.stats);
+    total.blocks.append(&mut part.blocks);
+    total.windows.append(&mut part.windows);
+    total.total_rows += part.total_rows;
+    total.preview.append(&mut part.preview);
+}
+
+fn merge_stats(total: &mut ScanStats, window: ScanStats) {
+    total.series += window.series;
+    total.samples += window.samples;
+    total.skipped_blocks += window.skipped_blocks;
+    total.skipped_series += window.skipped_series;
+    total.stale_dropped += window.stale_dropped;
+    total.deleted_samples += window.deleted_samples;
+    total.errors.extend(window.errors);
 }
 
 fn append_record(

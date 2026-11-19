@@ -118,6 +118,12 @@ missing, extra or mismatched series. A Parquet output must carry the
 
 ## Configuration and retention
 
+Global flags: `--threads N` sizes the Rayon pool used for parallel output
+windows (`1` = sequential, lowest peak memory); `--memory-limit` is advisory
+and logged; `--log-format json` emits structured logs; `--progress` logs one line per
+converted window; `--dry-run` performs the full selection and plan without
+writing files.
+
 Useful output flags:
 
 ```text
@@ -150,3 +156,18 @@ target retention and exits `5` when `--retention-action refuse` is set.
 | `unsupported object-store scheme` | use `s3://`, `gs://` or `az://` |
 | `contains WAL data; stop the server or pass --force` | target may be live; index install is unsafe |
 | `retention warning` | imported range is older than the target retention |
+
+## End-to-end verification
+
+`scripts/e2e.sh` (or `make e2e`) starts a pinned Parqtel container, imports the
+real fixture through both `files` and `otlp` modes, re-runs the import to prove
+idempotence, compacts the imported blocks, and reconciles after every step:
+
+```bash
+PARQTEL_IMAGE=parqtel-e2e bash scripts/e2e.sh
+```
+
+The compose file is `deploy/e2e/docker-compose.yml`; it publishes the HTTP API
+on `127.0.0.1:18080` and OTLP gRPC on `14317`. Live reconciliation uses a
+two-minute source slice because Parqtel's instant-query path is intentionally
+one request per sample.

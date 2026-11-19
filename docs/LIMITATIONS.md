@@ -64,6 +64,13 @@ semantics.
 - **No writer fencing in Parqtel targets.** The tool writes one data root and
   refuses a target with WAL data unless `--force`.
 
+## Live clone
+
+- **HTTP/JSON only.** The live sink uses Parqtel's `/v1/metrics/json`
+  endpoint. Protobuf and gRPC OTLP paths are decoded by Parqtel but are not
+  implemented by this tool yet; the JSON path preserves finite values exactly
+  and is check-pointed per series.
+
 ## Installation / visibility
 
 - **Index install requires a restart.** `clone --target <dir>` merges
@@ -83,3 +90,15 @@ semantics.
 - A TSDB writer, GUI, or multi-writer distributed coordinator.
 - Exact display of native histograms in Grafana through Parqtel, because the
   target has no native-histogram query type.
+
+## Verification
+
+- **Files mode is bit-exact.** `verify <source> <blocks>` compares
+  `(timestamp_ns, value_bits)` including NaN payloads, ±Inf and subnormals.
+- **Live mode normalises NaN payloads.** Parqtel's JSON query API returns
+  `"NaN"` without the original payload. `verify <source> <http-url>` compares
+  every NaN as canonical NaN and reports `nan_payloads_normalized` in the JSON
+  report; finite values remain bit-exact.
+- **Live mode queries 1 µs after the source timestamp.** Parqtel parses `time`
+  as f64 seconds; at 2022 epochs an exact boundary can evaluate a few hundred
+  nanoseconds early and miss the row.

@@ -84,6 +84,11 @@ pub struct CloneStats {
     pub retries: u64,
 }
 
+enum PostFailure {
+    TooLarge,
+    Other(anyhow::Error),
+}
+
 impl OtlpSink {
     pub fn new(endpoint: &str) -> Result<Self> {
         let endpoint = normalize_endpoint(endpoint);
@@ -139,21 +144,36 @@ impl OtlpSink {
                 start = index;
                 continue;
             }
-            let body = build_body(metric, kind, labels, resource, &batch)?;
-            if body.len() > self.max_body_bytes && batch.len() > 1 {
-                let keep = (batch.len() / 2).max(1);
-                batch.truncate(keep);
-                index = start + keep;
+            loop {
+                let body = build_body(metric, kind, labels, resource, &batch)?;
+                if body.len() > self.max_body_bytes && batch.len() > 1 {
+                    let keep = (batch.len() / 2).max(1);
+                    batch.truncate(keep);
+                    index = start + keep;
+                    continue;
+                }
+                if body.len() > self.max_body_bytes {
+                    anyhow::bail!(
+                        "single OTLP data point is {} bytes, above the {} byte body limit",
+                        body.len(),
+                        self.max_body_bytes
+                    );
+                }
+                match self.post_with_retry(&body, &mut stats) {
+                    Ok(()) => break,
+                    Err(PostFailure::TooLarge) if batch.len() > 1 => {
+                        let keep = (batch.len() / 2).max(1);
+                        batch.truncate(keep);
+                        index = start + keep;
+                    }
+                    Err(PostFailure::TooLarge) => {
+                        anyhow::bail!(
+                            "target rejected a single OTLP data point with 413 after size reduction"
+                        );
+                    }
+                    Err(PostFailure::Other(error)) => return Err(error),
+                }
             }
-            let body = build_body(metric, kind, labels, resource, &batch)?;
-            if body.len() > self.max_body_bytes {
-                anyhow::bail!(
-                    "single OTLP data point is {} bytes, above the {} byte body limit",
-                    body.len(),
-                    self.max_body_bytes
-                );
-            }
-            self.post_with_retry(&body, &mut stats)?;
             if let Some((timestamp_ns, _)) = batch.last() {
                 checkpoint.set(&key, *timestamp_ns);
                 checkpoint.save()?;
@@ -165,7 +185,11 @@ impl OtlpSink {
         Ok(stats)
     }
 
-    fn post_with_retry(&self, body: &[u8], stats: &mut CloneStats) -> Result<()> {
+    fn post_with_retry(
+        &self,
+        body: &[u8],
+        stats: &mut CloneStats,
+    ) -> std::result::Result<(), PostFailure> {
         let mut attempt = 0u32;
         loop {
             attempt += 1;
@@ -187,15 +211,17 @@ impl OtlpSink {
                         .and_then(|value| value.parse::<u64>().ok());
                     let text = response.text().unwrap_or_default();
                     if status.as_u16() == 413 {
-                        anyhow::bail!("target rejected the body with 413: {text}");
+                        return Err(PostFailure::TooLarge);
                     }
                     if status.as_u16() != 429 && !status.is_server_error() {
-                        anyhow::bail!("OTLP ingest failed with {status}: {text}");
+                        return Err(PostFailure::Other(anyhow::anyhow!(
+                            "OTLP ingest failed with {status}: {text}"
+                        )));
                     }
                     if attempt >= 8 {
-                        anyhow::bail!(
+                        return Err(PostFailure::Other(anyhow::anyhow!(
                             "OTLP ingest failed after {attempt} attempts: {status} {text}"
-                        );
+                        )));
                     }
                     stats.retries += 1;
                     let backoff = retry_after.unwrap_or_else(|| {
@@ -206,7 +232,9 @@ impl OtlpSink {
                 }
                 Err(error) => {
                     if attempt >= 8 {
-                        return Err(error).context("OTLP ingest request failed");
+                        return Err(PostFailure::Other(
+                            anyhow::Error::new(error).context("OTLP ingest request failed"),
+                        ));
                     }
                     stats.retries += 1;
                     std::thread::sleep(Duration::from_millis(
@@ -330,5 +358,106 @@ mod tests {
         checkpoint.save().unwrap();
         let loaded = Checkpoint::load(&path).unwrap();
         assert_eq!(loaded.get("up{}"), Some(10));
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn splits_a_batch_after_a_413() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let server_stop = stop.clone();
+        let server_accepted = accepted.clone();
+        let server = std::thread::spawn(move || {
+            while !server_stop.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(stream) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let header_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4)
+                    .unwrap();
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length: ")
+                            .or_else(|| line.strip_prefix("Content-Length: "))
+                    })
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap();
+                let mut body = request[header_end..].to_vec();
+                while body.len() < length {
+                    let read = stream.read(&mut chunk).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&chunk[..read]);
+                }
+                server_accepted.fetch_add(1, Ordering::Relaxed);
+                let status = if body.len() > 512 {
+                    "413 Payload Too Large"
+                } else {
+                    "200 OK"
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                )
+                .unwrap();
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut checkpoint = Checkpoint::load(&dir.path().join("checkpoint.json")).unwrap();
+        let sink = OtlpSink::new(&format!("http://{address}"))
+            .unwrap()
+            .with_max_body_bytes(1024 * 1024);
+        let samples: Vec<(i64, f64)> = (0..100).map(|i| (i as i64, i as f64)).collect();
+        let stats = sink
+            .send_series(
+                "up",
+                MetricKind::Gauge,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &samples,
+                &mut checkpoint,
+            )
+            .unwrap();
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(stats.samples, 100);
+        assert!(stats.requests > 1, "413 should force a split");
+        assert!(accepted.load(Ordering::Relaxed) > 1);
     }
 }

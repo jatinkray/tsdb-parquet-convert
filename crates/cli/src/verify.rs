@@ -28,6 +28,9 @@ pub struct VerifyReport {
     pub output_series: usize,
     pub source_samples: u64,
     pub output_samples: u64,
+    /// NaN payloads cannot survive the Parqtel JSON query API; those samples
+    /// are compared as canonical NaN in live mode. Files mode remains bit-exact.
+    pub nan_payloads_normalized: u64,
     pub missing: Vec<String>,
     pub extra: Vec<String>,
     pub mismatched: Vec<Mismatch>,
@@ -71,7 +74,17 @@ pub fn verify(options: &VerifyOptions, output_dir: &Path) -> Result<VerifyReport
     })?;
 
     let mut output_digests: BTreeMap<String, Digest> = BTreeMap::new();
-    read_parquet_dir(output_dir, &mut output_digests)?;
+    let min_ns = options
+        .source
+        .min_time_ms
+        .and_then(|value| value.checked_mul(1_000_000))
+        .unwrap_or(i64::MIN);
+    let max_ns = options
+        .source
+        .max_time_ms
+        .and_then(|value| value.checked_mul(1_000_000))
+        .unwrap_or(i64::MAX);
+    read_parquet_dir(output_dir, min_ns, max_ns, &mut output_digests)?;
 
     let mut report = VerifyReport {
         source_series: source_digests.len(),
@@ -106,7 +119,12 @@ pub fn verify(options: &VerifyOptions, output_dir: &Path) -> Result<VerifyReport
     Ok(report)
 }
 
-fn read_parquet_dir(dir: &Path, out: &mut BTreeMap<String, Digest>) -> Result<()> {
+fn read_parquet_dir(
+    dir: &Path,
+    min_ns: i64,
+    max_ns: i64,
+    out: &mut BTreeMap<String, Digest>,
+) -> Result<()> {
     let mut files = Vec::new();
     for entry in walkdir::WalkDir::new(dir).max_depth(2).into_iter() {
         let entry = entry?;
@@ -121,13 +139,18 @@ fn read_parquet_dir(dir: &Path, out: &mut BTreeMap<String, Digest>) -> Result<()
     }
     files.sort();
     for path in files {
-        read_parquet_block(&path, out)
+        read_parquet_block(&path, min_ns, max_ns, out)
             .with_context(|| format!("reading output block {}", path.display()))?;
     }
     Ok(())
 }
 
-fn read_parquet_block(path: &Path, out: &mut BTreeMap<String, Digest>) -> Result<()> {
+fn read_parquet_block(
+    path: &Path,
+    min_ns: i64,
+    max_ns: i64,
+    out: &mut BTreeMap<String, Digest>,
+) -> Result<()> {
     let file = std::fs::File::open(path)?;
     let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?;
     let table_text = builder
@@ -178,9 +201,12 @@ fn read_parquet_block(path: &Path, out: &mut BTreeMap<String, Digest>) -> Result
             let Some((_, _, key)) = starts.get(cursor) else {
                 anyhow::bail!("row {row} is not covered by the series index");
             };
-            let digest = out.entry(key.clone()).or_default();
-            let value = vf.value(row_in_batch);
-            add_sample(digest, ts.value(row_in_batch), value.to_bits());
+            let timestamp_ns = ts.value(row_in_batch);
+            if timestamp_ns >= min_ns && timestamp_ns < max_ns {
+                let digest = out.entry(key.clone()).or_default();
+                let value = vf.value(row_in_batch);
+                add_sample(digest, timestamp_ns, value.to_bits());
+            }
             row += 1;
         }
     }
@@ -202,6 +228,7 @@ pub fn verify_live(options: &VerifyOptions, target: &str) -> Result<VerifyReport
         .build()?;
     let mut source_digests: BTreeMap<String, Digest> = BTreeMap::new();
     let mut live_digests: BTreeMap<String, Digest> = BTreeMap::new();
+    let mut nan_payloads_normalized = 0u64;
     source.scan(|record| {
         let Some(metric) = record.metric_name().map(str::to_string) else {
             return Ok(());
@@ -220,30 +247,67 @@ pub fn verify_live(options: &VerifyOptions, target: &str) -> Result<VerifyReport
                     timestamp_ms: sample.timestamp_ms,
                 },
             )?;
-            add_sample(source_digest, timestamp_ns, sample.value.to_bits());
-            let time = format!("{:.3}", sample.timestamp_ms as f64 / 1000.0);
+            if sample.value.is_nan() {
+                nan_payloads_normalized += 1;
+            }
+            let source_bits = if sample.value.is_nan() {
+                f64::NAN.to_bits()
+            } else {
+                sample.value.to_bits()
+            };
+            add_sample(source_digest, timestamp_ns, source_bits);
+            // Parqtel parses `time` as floating-point seconds. At 2022
+            // timestamps, `1.65e9` seconds loses sub-millisecond precision, so
+            // an instant query exactly on a sample boundary can be evaluated a
+            // few hundred nanoseconds *before* the row. Query 1 µs later; the
+            // sample interval is at least 1 ms in every Prometheus block.
+            let query_ns = timestamp_ns.saturating_add(1_000);
+            let time = format!(
+                "{}.{:09}",
+                query_ns.div_euclid(1_000_000_000),
+                query_ns.rem_euclid(1_000_000_000)
+            );
             let response = client
                 .get(&endpoint)
                 .query(&[("query", selector.as_str()), ("time", time.as_str())])
                 .send()
-                .and_then(reqwest::blocking::Response::error_for_status)
                 .map_err(|error| {
                     tsdb_reader::Error::Source(format!("querying {endpoint}: {error}"))
                 })?;
-            let body: serde_json::Value = response.json().map_err(|error| {
-                tsdb_reader::Error::Source(format!("decoding query response: {error}"))
+            let status = response.status();
+            let text = response.text().map_err(|error| {
+                tsdb_reader::Error::Source(format!("reading query response: {error}"))
+            })?;
+            if !status.is_success() {
+                return Err(tsdb_reader::Error::Source(format!(
+                    "querying {endpoint} for {selector} at {time}: HTTP {status}: {text}"
+                )));
+            }
+            let body: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+                tsdb_reader::Error::Source(format!(
+                    "decoding query response ({status}) for {selector}: {error}: {text}"
+                ))
             })?;
             let value = body
                 .get("data")
                 .and_then(|data| data.get("result"))
                 .and_then(|result| result.as_array())
-                .and_then(|result| result.first())
+                .and_then(|result| {
+                    result
+                        .iter()
+                        .find(|series| result_matches(series, &metric, &record.labels))
+                })
                 .and_then(|series| series.get("value"))
                 .and_then(|value| value.get(1))
                 .and_then(|value| value.as_str())
                 .and_then(|value| value.parse::<f64>().ok());
             if let Some(value) = value {
-                add_sample(live_digest, timestamp_ns, value.to_bits());
+                let live_bits = if value.is_nan() {
+                    f64::NAN.to_bits()
+                } else {
+                    value.to_bits()
+                };
+                add_sample(live_digest, timestamp_ns, live_bits);
             }
         }
         Ok(())
@@ -254,6 +318,7 @@ pub fn verify_live(options: &VerifyOptions, target: &str) -> Result<VerifyReport
         output_series: live_digests.len(),
         source_samples: source_digests.values().map(|digest| digest.samples).sum(),
         output_samples: live_digests.values().map(|digest| digest.samples).sum(),
+        nan_payloads_normalized,
         ..VerifyReport::default()
     };
     for (key, source) in &source_digests {
@@ -278,10 +343,14 @@ pub fn verify_live(options: &VerifyOptions, target: &str) -> Result<VerifyReport
 }
 
 fn build_selector(metric: &str, labels: &tsdb_reader::Labels) -> String {
+    // Parqtel's selector parser splits on commas without honoring quotes, so a
+    // label value containing `,` cannot appear in a matcher. Keep every safe
+    // label to narrow the query, then filter the returned vector by the exact
+    // label set in `result_matches`.
     let mut out = String::from(metric);
     let mut first = true;
     for (key, value) in labels {
-        if key == "__name__" {
+        if key == "__name__" || value.contains(',') || value.contains('{') || value.contains('}') {
             continue;
         }
         if first {
@@ -306,6 +375,30 @@ fn build_selector(metric: &str, labels: &tsdb_reader::Labels) -> String {
     out
 }
 
+fn result_matches(series: &serde_json::Value, metric: &str, labels: &tsdb_reader::Labels) -> bool {
+    let Some(metric_labels) = series.get("metric").and_then(|value| value.as_object()) else {
+        return false;
+    };
+    if metric_labels
+        .get("__name__")
+        .and_then(|value| value.as_str())
+        != Some(metric)
+    {
+        return false;
+    }
+    let expected = labels
+        .iter()
+        .filter(|(key, _)| key.as_str() != "__name__")
+        .count();
+    if metric_labels.len() != expected + 1 {
+        return false;
+    }
+    labels.iter().all(|(key, value)| {
+        key == "__name__"
+            || metric_labels.get(key).and_then(|value| value.as_str()) == Some(value.as_str())
+    })
+}
+
 fn series_key(metric: &str, labels_json: &str) -> String {
     format!("{metric}{labels_json}")
 }
@@ -320,4 +413,49 @@ fn add_sample(digest: &mut Digest, timestamp_ns: i64, value_bits: u64) {
     digest.samples += 1;
     digest.first_ts_ns.get_or_insert(timestamp_ns);
     digest.last_ts_ns = Some(timestamp_ns);
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    #[test]
+    fn selector_omits_values_parqtel_cannot_parse() {
+        let labels = tsdb_reader::Labels::from([
+            ("__name__".to_string(), "node_dmi_info".to_string()),
+            ("job".to_string(), "node-exporter".to_string()),
+            (
+                "product_name".to_string(),
+                "Standard PC (i440FX + PIIX, 1996)".to_string(),
+            ),
+        ]);
+        let selector = build_selector("node_dmi_info", &labels);
+        assert_eq!(selector, "node_dmi_info{job=\"node-exporter\"}");
+    }
+
+    #[test]
+    fn result_matching_uses_the_exact_label_set() {
+        let labels = tsdb_reader::Labels::from([
+            ("__name__".to_string(), "m".to_string()),
+            ("job".to_string(), "api".to_string()),
+            ("x".to_string(), "1,2".to_string()),
+        ]);
+        let exact = serde_json::json!({
+            "metric": {"__name__": "m", "job": "api", "x": "1,2"},
+            "value": [1, "2"]
+        });
+        let wrong = serde_json::json!({
+            "metric": {"__name__": "m", "job": "api", "x": "other"},
+            "value": [1, "2"]
+        });
+        let superset = serde_json::json!({
+            "metric": {"__name__": "m", "job": "api", "x": "1,2", "index": "extra"},
+            "value": [1, "2"]
+        });
+        assert!(result_matches(&exact, "m", &labels));
+        assert!(!result_matches(&wrong, "m", &labels));
+        assert!(!result_matches(&superset, "m", &labels));
+    }
 }

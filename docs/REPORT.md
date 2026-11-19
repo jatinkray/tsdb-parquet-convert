@@ -25,6 +25,10 @@
 | deny | `cargo deny check` | advisories, bans, licenses and sources pass (unmaintained advisories documented in `deny.toml`) |
 | files conversion | `tsdb2parqtel convert tests/fixtures/testblock --out /tmp/... --max-rows-per-block 1000000` | pass |
 | block reconciliation | `tsdb2parqtel verify ... /tmp/...` | 865/865 samples, 23/23 series, 0 mismatches |
+| files e2e | `scripts/e2e.sh` (real Parqtel container, restart adoption) | 34,410 series / 140,718 samples in window, 0 mismatch; 716 NaN payloads normalized by live JSON |
+| OTLP e2e | same script, `/v1/metrics/json` | 23 series / 3,985 samples imported, 0 retry, live reconcile 0 mismatch |
+| OTLP resume | re-run same checkpoint | 0 requests, 3,985 samples skipped, reconcile still 0 mismatch |
+| compaction e2e | `parqtel compact` then reconcile | 0 blocks compacted (single window), reconcile 0 mismatch |
 | install + Parqtel restart | `clone --target /tmp/...`; query `/api/v1/query_range` | labels, timestamps and values matched |
 | OTLP clone | `clone --target http://127.0.0.1:18091` | 66 samples, 0 retries; queried back identically |
 | live verify | `verify ... http://127.0.0.1:18092` | 66/66 samples, 0 mismatches |
@@ -62,16 +66,18 @@ purpose is throughput and memory, not compression ratio.
 | Metric | Result |
 |---|---|
 | Samples | 100,000,000 |
-| Wall time | 47.04 s |
-| Throughput | ≈2,126,000 samples/s |
-| Peak RSS | 3,494,392 KiB (≈3.33 GiB) |
+| Wall time | 6.55 s |
+| Throughput | ≈15,267,000 samples/s (8 parallel windows, ≈1.9M/core-s) |
+| Peak RSS | 1,142,012 KiB (≈1.09 GiB) |
 | Output | 17 MiB, 209 Parquet files |
-| Reconcile | 100,000,000/100,000,000 samples, 1000/1000 series, 0 mismatches (21.4 s) |
+| Reconcile | 100,000,000/100,000,000 samples, 1000/1000 series, 0 mismatches |
 
-Peak RSS grows with total rows because `convert` retains every window in
-`BTreeMap<WindowKey, WindowState>` until the full source scan finishes. This is
-a known scalability limit: budget roughly 36 bytes per sample, or split the
-source by block/time range for very large migrations.
+`convert` scans one output window at a time and flushes at
+`--max-rows-per-block`; independent windows run on Rayon with `--threads`.
+Peak RSS is bounded by concurrent windows rather than total source size: eight
+1M-row windows peaked at 1.09 GiB. `--threads 1` gives the single-window path
+(109 MiB on the same source). The previous one-pass implementation peaked at
+3.33 GiB.
 
 ## Open risks / backlog
 

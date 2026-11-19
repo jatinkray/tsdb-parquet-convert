@@ -274,9 +274,9 @@ fn run(cli: Cli) -> Result<i32> {
     let _progress = cli.progress;
     match cli.command {
         Commands::Inspect(args) => inspect(args),
-        Commands::Plan(args) => plan(args),
-        Commands::Convert(args) => run_convert(args, dry_run),
-        Commands::Clone(args) => clone(args, dry_run),
+        Commands::Plan(args) => plan(args, cli.progress),
+        Commands::Convert(args) => run_convert(args, dry_run, cli.progress),
+        Commands::Clone(args) => clone(args, dry_run, cli.progress),
         Commands::Verify(args) => run_verify(args),
     }
 }
@@ -332,6 +332,7 @@ fn inspect(args: InspectArgs) -> Result<i32> {
                 "blocks": blocks,
                 "series": stats.series,
                 "samples": stats.samples,
+                "estimated_output_bytes": stats.samples,
                 "stale_dropped": stats.stale_dropped,
                 "skipped_series": stats.skipped_series,
                 "errors": stats.errors,
@@ -355,9 +356,10 @@ fn inspect(args: InspectArgs) -> Result<i32> {
             }
         }
         println!(
-            "total: blocks={} series={} samples={} skipped_series={} stale_dropped={} errors={}",
+            "total: blocks={} series={} samples={} estimated_output_bytes={} skipped_series={} stale_dropped={} errors={}",
             infos.len(),
             stats.series,
+            stats.samples,
             stats.samples,
             stats.skipped_series,
             stats.stale_dropped,
@@ -370,20 +372,28 @@ fn inspect(args: InspectArgs) -> Result<i32> {
     Ok(if stats.errors.is_empty() { 0 } else { 3 })
 }
 
-fn plan(args: PlanArgs) -> Result<i32> {
-    let options = build_convert_options(args.source, args.output, PathBuf::new(), true, false)?;
+fn plan(args: PlanArgs, progress: bool) -> Result<i32> {
+    let options = build_convert_options(
+        args.source,
+        args.output,
+        PathBuf::new(),
+        true,
+        false,
+        progress,
+    )?;
     let report = convert(&options)?;
     print_report(&report, args.json)?;
     Ok(if report.retention_refused { 5 } else { 0 })
 }
 
-fn run_convert(args: ConvertArgs, dry_run: bool) -> Result<i32> {
+fn run_convert(args: ConvertArgs, dry_run: bool, progress: bool) -> Result<i32> {
     let options = build_convert_options(
         args.source,
         args.output,
         args.out.clone(),
         dry_run,
         args.sidecar,
+        progress,
     )?;
     let report = convert(&options)?;
     print_report(&report, false)?;
@@ -402,6 +412,7 @@ fn build_convert_options(
     out_dir: PathBuf,
     dry_run: bool,
     sidecar: bool,
+    progress: bool,
 ) -> Result<ConvertOptions> {
     Ok(ConvertOptions {
         source: source.to_options()?,
@@ -415,6 +426,7 @@ fn build_convert_options(
         dry_run,
         target_retention_days: output.target_retention_days,
         retention_refuse: output.retention_action == "refuse",
+        progress,
     })
 }
 
@@ -480,11 +492,12 @@ fn run_verify(args: VerifyArgs) -> Result<i32> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
-            "source_series={} output_series={} source_samples={} output_samples={} missing={} extra={} mismatched={}",
+            "source_series={} output_series={} source_samples={} output_samples={} nan_payloads_normalized={} missing={} extra={} mismatched={}",
             report.source_series,
             report.output_series,
             report.source_samples,
             report.output_samples,
+            report.nan_payloads_normalized,
             report.missing.len(),
             report.extra.len(),
             report.mismatched.len()
@@ -493,7 +506,7 @@ fn run_verify(args: VerifyArgs) -> Result<i32> {
     Ok(if report.ok() { 0 } else { 4 })
 }
 
-fn clone(args: CloneArgs, dry_run: bool) -> Result<i32> {
+fn clone(args: CloneArgs, dry_run: bool, progress: bool) -> Result<i32> {
     if args.target.starts_with("http://") || args.target.starts_with("https://") {
         return clone_otlp(args, dry_run);
     }
@@ -508,9 +521,39 @@ fn clone(args: CloneArgs, dry_run: bool) -> Result<i32> {
     if output.target_retention_days.is_none() {
         output.target_retention_days = read_target_retention(&target);
     }
-    let options = build_convert_options(args.source, output, target.clone(), dry_run, true)?;
-    let report = convert(&options)?;
     if !dry_run {
+        std::fs::create_dir_all(&target)
+            .with_context(|| format!("creating target directory {}", target.display()))?;
+    }
+    let staging = if dry_run {
+        None
+    } else {
+        Some(
+            tempfile::Builder::new()
+                .prefix(".tsdb2parqtel-")
+                .tempdir_in(&target)
+                .with_context(|| format!("creating staging directory in {}", target.display()))?,
+        )
+    };
+    let out_dir = staging
+        .as_ref()
+        .map_or_else(|| target.clone(), |dir| dir.path().to_path_buf());
+    let options = build_convert_options(
+        args.source,
+        output,
+        out_dir.clone(),
+        dry_run,
+        false,
+        progress,
+    )?;
+    let mut report = convert(&options)?;
+    if let Some(staging) = staging {
+        for block in &mut report.blocks {
+            let final_path = target.join(&block.filename);
+            std::fs::rename(staging.path().join(&block.filename), &final_path)
+                .with_context(|| format!("installing block {}", final_path.display()))?;
+            block.metadata.path = final_path;
+        }
         install_index(&target, &report)?;
     }
     print_report(&report, false)?;
@@ -524,7 +567,7 @@ fn clone(args: CloneArgs, dry_run: bool) -> Result<i32> {
 }
 
 fn read_target_retention(target: &Path) -> Option<u64> {
-    let candidates = [
+    let mut candidates = vec![
         target.join("parqtel.toml"),
         target.join("config/default.toml"),
         target
@@ -532,6 +575,9 @@ fn read_target_retention(target: &Path) -> Option<u64> {
             .map(|parent| parent.join("parqtel.toml"))
             .unwrap_or_default(),
     ];
+    if let Some(config) = std::env::var_os("PARQTEL_CONFIG") {
+        candidates.push(PathBuf::from(config));
+    }
     for path in candidates {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;

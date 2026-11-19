@@ -458,3 +458,57 @@ mod tests {
         assert_eq!(reader.read_bit().unwrap(), 0);
     }
 }
+
+#[cfg(test)]
+mod segment_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    fn uvarint_bytes(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        while value >= 0x80 {
+            out.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+        out
+    }
+
+    #[test]
+    fn reads_a_chunk_from_a_second_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("chunks")).unwrap();
+        let mut body = vec![0, 1, 0xd0, 0x0f];
+        body.extend_from_slice(&1.5f64.to_bits().to_be_bytes());
+        let mut record = uvarint_bytes(body.len() as u64);
+        record.push(1);
+        record.extend_from_slice(&body);
+        record.extend_from_slice(
+            &crc32c::crc32c(&{
+                let mut checked = vec![1];
+                checked.extend_from_slice(&body);
+                checked
+            })
+            .to_be_bytes(),
+        );
+
+        let mut segment = Vec::new();
+        segment.extend_from_slice(&MAGIC.to_be_bytes());
+        segment.extend_from_slice(&[1, 0, 0, 0]);
+        segment.extend_from_slice(&record);
+        std::fs::write(dir.path().join("chunks/000002"), segment).unwrap();
+
+        let reader = ChunkReader::new(dir.path());
+        let (encoding, samples) = reader.read_chunk((1u64 << 32) | 8).unwrap();
+        assert_eq!(encoding, Encoding::Xor);
+        match samples {
+            ChunkSamples::Floats(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].timestamp_ms, 1000);
+                assert_eq!(samples[0].value, 1.5);
+            }
+            ChunkSamples::Histograms(_) => panic!("expected float samples"),
+        }
+    }
+}
