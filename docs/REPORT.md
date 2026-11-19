@@ -14,7 +14,7 @@
 |---|---|---|
 | v1 index/chunk/tombstone parse | `cargo test --manifest-path crates/tsdb-reader/Cargo.toml --test fixture_v1` | pass |
 | v2 real block, 35,354 series / 5.55M samples | `--test fixture_v2` | pass |
-| **promtool oracle** | `promtool tsdb dump` vs native `dump_tsv`, then `scripts/check_promtool_oracle.py` | **5,551,013/5,551,013 samples match sample-for-sample** |
+| **promtool oracle** | Prometheus 2.54.0 `promtool tsdb dump` vs native `dump_tsv`, then `scripts/check_promtool_oracle.py` | **5,551,013/5,551,013 samples match sample-for-sample** |
 | native histogram decode dispatch | `--test native_hist` | pass; explicit unrepresentable-series error |
 | malformed input/property tests | `--test properties` | pass; no panics |
 | Parquet schema/footer/naming | `cargo test -p parqtel-sink --test write_block` | pass |

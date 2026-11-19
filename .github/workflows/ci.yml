@@ -21,6 +21,15 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --locked
       - run: cargo build --release --locked
+      - name: Prometheus oracle
+        run: |
+          curl -fsSL -o /tmp/prometheus.tar.gz https://github.com/prometheus/prometheus/releases/download/v2.54.0/prometheus-2.54.0.linux-amd64.tar.gz
+          tar -xzf /tmp/prometheus.tar.gz -C /tmp prometheus-2.54.0.linux-amd64/promtool
+          rm -rf /tmp/promdb && mkdir -p /tmp/promdb/wal
+          cp -a crates/tsdb-reader/tests/fixtures/testblock /tmp/promdb/01G0P9P6T0VSA5Z484BRGH2N68
+          /tmp/prometheus-2.54.0.linux-amd64/promtool tsdb dump --sandbox-dir-root=/tmp /tmp/promdb > /tmp/promtool.dump
+          cargo run --quiet --release --example dump_tsv -- crates/tsdb-reader/tests/fixtures/testblock > /tmp/native.dump
+          python3 scripts/check_promtool_oracle.py /tmp/promtool.dump /tmp/native.dump
 
   deny:
     runs-on: ubuntu-latest
