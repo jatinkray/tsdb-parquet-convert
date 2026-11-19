@@ -29,6 +29,8 @@
 | OTLP e2e | same script, `/v1/metrics/json` | 23 series / 3,985 samples imported, 0 retry, live reconcile 0 mismatch |
 | OTLP resume | re-run same checkpoint | 0 requests, 3,985 samples skipped, reconcile still 0 mismatch |
 | compaction e2e | `parqtel compact` then reconcile | 0 blocks compacted (single window), reconcile 0 mismatch |
+| retention refusal | `plan <fixture> --target-retention-days 1 --retention-action refuse` | exit 5, exact `storage.retention_days` warning |
+| dry run | `--dry-run convert <fixture> --out /tmp/...` | exit 0, output directory not created |
 | install + Parqtel restart | `clone --target /tmp/...`; query `/api/v1/query_range` | labels, timestamps and values matched |
 | OTLP clone | `clone --target http://127.0.0.1:18091` | 66 samples, 0 retries; queried back identically |
 | live verify | `verify ... http://127.0.0.1:18092` | 66/66 samples, 0 mismatches |
