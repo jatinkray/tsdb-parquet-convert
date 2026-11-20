@@ -7,7 +7,7 @@ license.workspace = true
 description = "OpenTelemetry to Parqtel metric conversion for live clones"
 
 [dependencies]
-parqtel-sink = { path = "../parqtel-sink" }
+parqtel-sink = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

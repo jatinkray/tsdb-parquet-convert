@@ -18,8 +18,8 @@ reqwest = { workspace = true }
 parqtel-core = { git = "https://github.com/parqtel/parqtel-oss", rev = "63a9cf1cdc9e8cc4855565b6d0b67fa6c366cef4", version = "0.3.1" }
 walkdir = { workspace = true }
 xxhash-rust = { workspace = true }
-parquet-sink = { path = "../parquet-sink" }
-parqtel-sink = { path = "../parqtel-sink" }
+parquet-sink = { workspace = true }
+parqtel-sink = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -28,8 +28,8 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 toml = { workspace = true }
-tsdb-reader = { path = "../tsdb-reader" }
-otlp-sink = { path = "../otlp-sink" }
+tsdb-reader = { workspace = true }
+otlp-sink = { workspace = true }
 
 [[bin]]
 name = "tsdb2parqtel"

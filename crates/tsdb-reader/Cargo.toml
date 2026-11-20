@@ -19,7 +19,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 walkdir = { workspace = true }
 tsdb-reader-upstream = { workspace = true, default-features = false }
-parqtel-sink = { path = "../parqtel-sink" }
+parqtel-sink = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }

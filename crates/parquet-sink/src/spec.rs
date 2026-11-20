@@ -210,7 +210,8 @@ impl SchemaSpec {
                         .to_string(),
                 ));
             }
-            if column.column_type.is_timestamp() || matches!(column.column_type, ColumnType::Date32) {
+            if column.column_type.is_timestamp() || matches!(column.column_type, ColumnType::Date32)
+            {
                 if !matches!(source, ColumnSource::Timestamp) {
                     let reason = if column.column_type.is_timestamp() {
                         "a unit conversion the schema cannot express"
@@ -568,7 +569,10 @@ mod tests {
         let parsed = spec(
             "columns:\n  - name: ts\n    type: timestamp_ns\n    source: timestamp\n  - name: day\n    type: date32\n    source: timestamp\n",
         )?;
-        assert_eq!(parsed.arrow_schema().field(1).data_type(), &DataType::Date32);
+        assert_eq!(
+            parsed.arrow_schema().field(1).data_type(),
+            &DataType::Date32
+        );
         Ok(())
     }
 
@@ -578,7 +582,10 @@ mod tests {
             "columns:\n  - name: day\n    type: date32\n    source: label:day\n  - name: ts\n    type: timestamp_ns\n    source: timestamp\n",
         );
         let message = error.err().map(|e| e.to_string()).unwrap_or_default();
-        assert!(message.contains("must use `source: timestamp`"), "{message}");
+        assert!(
+            message.contains("must use `source: timestamp`"),
+            "{message}"
+        );
         assert!(message.contains("granularity"), "{message}");
     }
 
