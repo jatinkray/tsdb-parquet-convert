@@ -67,6 +67,9 @@ enum Commands {
     EmitDdl(EmitDdlArgs),
     /// Merge small schema-mode Parquet files into larger ones.
     Compact(CompactArgs),
+    /// Export a source to a data lake: convert, optional rollup/compaction,
+    /// manifest, cost estimate and optional verification.
+    Migrate(MigrateArgs),
     /// Convert and install into a Parqtel data directory or replay over OTLP.
     Clone(CloneArgs),
     /// Reconcile source and converted blocks per series.
@@ -256,6 +259,39 @@ struct ConvertArgs {
 }
 
 #[derive(Debug, Args)]
+struct MigrateArgs {
+    #[command(flatten)]
+    source: SourceArgs,
+    /// Output directory or object-store URL.
+    #[arg(long)]
+    out: String,
+    #[command(flatten)]
+    output: OutputArgs,
+    #[arg(long, value_name = "FILE")]
+    schema: Option<PathBuf>,
+    #[arg(long, value_name = "NAME", conflicts_with = "schema")]
+    preset: Option<String>,
+    /// Roll samples up per series (e.g. `5m`), one row per bucket.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    rollup: Option<u64>,
+    #[arg(long, value_name = "FUNC", default_value = "avg",
+          value_parser = ["avg", "sum", "min", "max", "last", "count"])]
+    rollup_func: String,
+    /// Incremental state file for repeated runs.
+    #[arg(long, value_name = "FILE")]
+    state: Option<PathBuf>,
+    /// Compact the written files into larger ones (local output only).
+    #[arg(long)]
+    compact: bool,
+    /// Rows per compacted file.
+    #[arg(long, default_value_t = 2_000_000)]
+    rows_per_file: usize,
+    /// Reconcile the written files against the source before finishing.
+    #[arg(long)]
+    verify: bool,
+}
+
+#[derive(Debug, Args)]
 struct CompactArgs {
     /// Directory holding the files to merge.
     input: PathBuf,
@@ -398,6 +434,7 @@ fn run(cli: Cli) -> Result<i32> {
         }
         Commands::EmitDdl(args) => emit_ddl(args),
         Commands::Compact(args) => run_compact(args),
+        Commands::Migrate(args) => run_migrate(args),
         Commands::Clone(args) => clone(args, dry_run, cli.progress),
         Commands::Verify(args) => run_verify(args),
     }
@@ -543,6 +580,94 @@ fn run_convert(args: ConvertArgs, dry_run: bool, progress: bool) -> Result<i32> 
     } else {
         3
     })
+}
+
+fn run_migrate(args: MigrateArgs) -> Result<i32> {
+    let spec = resolve_schema(args.schema, args.preset)?
+        .context("migrate writes schema-mode Parquet; pass --schema or --preset")?;
+    let destination = Destination::parse(&args.out)?;
+    if args.verify && args.rollup.is_some() {
+        anyhow::bail!(
+            "--verify compares every source sample; it cannot reconcile rolled-up output. Run `verify --preset …` on a raw export, or aggregate the source with your query engine"
+        );
+    }
+    if args.compact && destination.is_remote() {
+        anyhow::bail!(
+            "--compact reads files back; run it on the local copy after download for object-store output"
+        );
+    }
+    let rollup_func = RollupFunc::parse(&args.rollup_func)?;
+    let source_label = args.source.source.clone();
+    let options = build_convert_options(
+        args.source,
+        args.output,
+        OutputTarget {
+            destination: destination.clone(),
+            source_label,
+            dry_run: false,
+            sidecar: false,
+            state: args.state.clone(),
+            rollup: args.rollup,
+            rollup_func,
+        },
+        Some(spec.clone()),
+        false,
+    )?;
+    let report = convert(&options)?;
+
+    let mut compacted = None;
+    let mut data_dir = match &destination {
+        Destination::Local(path) => Some(path.clone()),
+        Destination::Remote { .. } => None,
+    };
+    if args.compact {
+        let Some(input) = data_dir.clone() else {
+            anyhow::bail!("--compact needs a local output directory");
+        };
+        let out = input.join("compacted");
+        let compact_report =
+            compact::compact(&input, &out, &spec, &options.parquet, args.rows_per_file)?;
+        compacted = Some(compact_report);
+        data_dir = Some(out);
+    }
+
+    let mut verification = None;
+    if args.verify {
+        let Some(dir) = data_dir.clone() else {
+            anyhow::bail!("--verify needs a local output directory");
+        };
+        let verify_options = VerifyOptions {
+            source: options.source.clone(),
+            label_mapper: LabelMapper::new(LabelMode::Preserve, None)?,
+        };
+        let verified = verify_schema(&verify_options, &spec, &dir)?;
+        verification = Some(verified);
+    }
+
+    let bytes = report.files.iter().map(|file| file.bytes).sum::<u64>();
+    let summary = json!({
+        "rows_scanned": report.total_rows,
+        "rows_written": report.rows_written,
+        "files": report.files.len(),
+        "bytes": bytes,
+        "cost_per_month": {
+            "s3_standard_usd": cost(bytes, 0.023),
+            "s3_glacier_instant_usd": cost(bytes, 0.004),
+        },
+        "manifest": report.manifest,
+        "compacted": compacted,
+        "verify": verification,
+    });
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    let ok = verification.as_ref().is_none_or(|report| report.ok());
+    Ok(if ok { 0 } else { 4 })
+}
+
+/// Monthly storage cost for `bytes` at `usd_per_gb` (list price, four decimals
+/// so small exports do not round to zero).
+fn cost(bytes: u64, usd_per_gb: f64) -> f64 {
+    (bytes as f64 / 1_073_741_824.0 * usd_per_gb * 10_000.0).round() / 10_000.0
 }
 
 fn run_compact(args: CompactArgs) -> Result<i32> {
