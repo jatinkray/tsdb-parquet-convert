@@ -5,6 +5,7 @@ mod destination;
 mod labels;
 mod metadata;
 mod presets;
+mod state;
 mod verify;
 
 use anyhow::{Context, Result};
@@ -236,6 +237,9 @@ struct ConvertArgs {
         help = "Use a built-in schema instead of a file (see `tsdb2parqtel presets`)"
     )]
     preset: Option<String>,
+    /// Incremental state file: skip source blocks a previous run already wrote.
+    #[arg(long, value_name = "FILE")]
+    state: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -442,6 +446,7 @@ fn plan(args: PlanArgs, progress: bool) -> Result<i32> {
             source_label,
             dry_run: true,
             sidecar: false,
+            state: None,
         },
         None,
         progress,
@@ -462,6 +467,7 @@ fn run_convert(args: ConvertArgs, dry_run: bool, progress: bool) -> Result<i32> 
             source_label,
             dry_run,
             sidecar: args.sidecar,
+            state: args.state,
         },
         resolve_schema(args.schema, args.preset)?,
         progress,
@@ -608,6 +614,7 @@ struct OutputTarget {
     source_label: String,
     dry_run: bool,
     sidecar: bool,
+    state: Option<PathBuf>,
 }
 
 /// A schema either comes from a file or from the built-in presets; `clap`
@@ -640,7 +647,11 @@ fn build_convert_options(
         source_label,
         dry_run,
         sidecar,
+        state,
     } = target;
+    if state.is_some() && schema.is_none() {
+        anyhow::bail!("--state needs --schema or --preset so every run writes the same layout");
+    }
     if destination.is_remote() && schema.is_none() {
         anyhow::bail!(
             "object-store output is for schema-mode Parquet; Parqtel blocks are a local directory format — add --schema or --preset"
@@ -692,6 +703,7 @@ fn build_convert_options(
         write_sidecar: sidecar,
         schema,
         parquet: output.parquet_options(),
+        state,
         dry_run,
         target_retention_days: output.target_retention_days,
         retention_refuse: output.retention_action == "refuse",
@@ -711,6 +723,7 @@ fn print_report(report: &ConvertReport, as_json: bool) -> Result<()> {
                 "preview": report.preview,
                 "sidecar": report.sidecar,
                 "manifest": report.manifest,
+                "blocks_skipped": report.blocks_skipped,
                 "retention_warning": report.retention_warning,
                 "retention_refused": report.retention_refused,
                 "stats": report.stats,
@@ -718,11 +731,12 @@ fn print_report(report: &ConvertReport, as_json: bool) -> Result<()> {
         );
     } else {
         println!(
-            "windows={} blocks={} files={} rows={} errors={}",
+            "windows={} blocks={} files={} rows={} skipped_blocks={} errors={}",
             report.windows.len(),
             report.blocks.len(),
             report.files.len(),
             report.total_rows,
+            report.blocks_skipped,
             report.stats.errors.len()
         );
         for window in &report.windows {
@@ -833,6 +847,7 @@ fn clone(args: CloneArgs, dry_run: bool, progress: bool) -> Result<i32> {
             source_label,
             dry_run,
             sidecar: false,
+            state: None,
         },
         None,
         progress,

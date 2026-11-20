@@ -3,6 +3,7 @@
 use crate::destination::Destination;
 use crate::labels::LabelMapper;
 use crate::metadata::Metadata;
+use crate::state::{schema_hash, State};
 use anyhow::{Context, Result};
 use parqtel_sink::{
     write_metric_block, write_sidecar_fragment, BlockFile, BlockSpec, DataPoint, MetricValue,
@@ -32,6 +33,8 @@ pub struct ConvertOptions {
     pub schema: Option<SchemaSpec>,
     /// Settings for the schema-driven writer.
     pub parquet: WriteOptions,
+    /// Incremental-run state: blocks recorded here are skipped next time.
+    pub state: Option<PathBuf>,
     pub dry_run: bool,
     pub target_retention_days: Option<u64>,
     pub retention_refuse: bool,
@@ -59,6 +62,8 @@ pub struct ConvertReport {
     pub sidecar: Option<PathBuf>,
     /// Where `manifest.json` was written, when the run produced one.
     pub manifest: Option<String>,
+    /// Source blocks skipped because the state file already covers them.
+    pub blocks_skipped: usize,
     pub retention_warning: Option<String>,
     pub retention_refused: bool,
 }
@@ -109,7 +114,45 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertReport> {
         .ok()
         .and_then(|seconds| seconds.checked_mul(1_000_000_000))
         .context("block-duration-secs is too large")?;
-    let source = Source::open(options.source.clone())?;
+    let mut source = Source::open(options.source.clone())?;
+    let mut incremental: Option<State> = None;
+    if let Some(state_path) = options.state.as_deref() {
+        let spec = options
+            .schema
+            .as_ref()
+            .context("--state needs a schema so runs write one layout")?;
+        let hash = schema_hash(spec)?;
+        let mut state = State::load(state_path, &hash)?;
+        let infos = source.block_infos();
+        let mut keep = std::collections::BTreeSet::new();
+        let mut skipped = 0usize;
+        let mut pending: Vec<(String, i64)> = Vec::new();
+        for info in &infos {
+            if state.covers(&info.meta.ulid, info.meta.max_time_ms) {
+                skipped += 1;
+            } else {
+                keep.insert(info.meta.ulid.clone());
+                pending.push((info.meta.ulid.clone(), info.meta.max_time_ms));
+            }
+        }
+        tracing::info!(
+            blocks = infos.len(),
+            skipped,
+            remaining = keep.len(),
+            "incremental run"
+        );
+        source = source.retain_blocks(&keep);
+        if keep.is_empty() {
+            return Ok(ConvertReport {
+                blocks_skipped: skipped,
+                ..ConvertReport::default()
+            });
+        }
+        for (ulid, max_time_ms) in pending {
+            state.record(&ulid, max_time_ms);
+        }
+        incremental = Some(state);
+    }
     // Remote destinations are assembled locally and uploaded per file, so the
     // writer always has a real directory to fsync and rename in.
     // Held for the whole run: dropping it would delete staged files before
@@ -193,6 +236,13 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertReport> {
             .destination
             .write_text(&format!("manifests/{run_id}.json"), &body)?;
         report.manifest = Some(format!("{}/manifest.json", options.destination.describe()));
+    }
+    if let (Some(state), Some(state_path), false) = (
+        incremental.as_mut(),
+        options.state.as_deref(),
+        options.dry_run,
+    ) {
+        state.save(state_path)?;
     }
     if let Some(days) = options
         .target_retention_days

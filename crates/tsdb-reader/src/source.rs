@@ -284,6 +284,14 @@ impl Source {
         counts
     }
 
+    /// Keeps only the blocks named in `keep`. Incremental runs use this to
+    /// drop blocks a previous run already wrote, so their chunks are never
+    /// decoded again.
+    pub fn retain_blocks(mut self, keep: &BTreeSet<String>) -> Self {
+        self.blocks.retain(|block| keep.contains(block.ulid()));
+        self
+    }
+
     pub fn block_count(&self) -> usize {
         self.blocks.len()
     }
