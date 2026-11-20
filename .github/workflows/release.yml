@@ -1,0 +1,179 @@
+name: Release
+
+# Publishes multi-architecture binaries for the workspace version.
+#
+# Triggers:
+#   * push to main that touches the manifest or the crates (a "major change");
+#     the release is only produced when `[workspace.package] version` names a
+#     version that has no `v<version>` release yet, so ordinary commits on an
+#     already-released version are no-ops.
+#   * manual dispatch, with `force` to rebuild and overwrite the assets of an
+#     existing release (for example after a tag was created by hand).
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild and overwrite the assets of an existing release
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: tsdb2parqtel
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      should_release: ${{ steps.gate.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: version
+        name: Read the workspace version
+        run: |
+          set -euo pipefail
+          version=$(awk '/^\[workspace\.package\]/{found=1; next} /^\[/{found=0} found && /^version *=/{gsub(/[",]/, "", $3); print $3; exit}' Cargo.toml)
+          if [ -z "${version}" ]; then
+            echo "no [workspace.package] version in Cargo.toml" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+          echo "workspace version: ${version}"
+      - id: gate
+        name: Skip when the version is already released
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          force="${{ inputs.force }}"
+          if gh release view "${tag}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            if [ "${force}" = "true" ]; then
+              echo "release ${tag} exists; rebuilding because force=true"
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "release ${tag} already exists; nothing to publish"
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            musl: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            musl: true
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            musl: false
+          - target: aarch64-apple-darwin
+            os: macos-15
+            musl: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            musl: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p ${{ env.BIN }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          target="${{ matrix.target }}"
+          suffix=""
+          if [ "${RUNNER_OS}" = "Windows" ]; then suffix=".exe"; fi
+          staging="staging"
+          mkdir -p "${staging}" dist
+          cp "target/${target}/release/${BIN}${suffix}" "${staging}/"
+          cp README.md LICENSE "${staging}/"
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            asset="dist/${BIN}-${version}-${target}.zip"
+            powershell -NoProfile -Command "Compress-Archive -Path '${staging}/*' -DestinationPath '${asset}' -Force"
+          else
+            asset="dist/${BIN}-${version}-${target}.tar.gz"
+            tar -czf "${asset}" -C "${staging}" .
+          fi
+          echo "packaged ${asset}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN }}-${{ needs.prepare.outputs.version }}-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.prepare.outputs.tag }}"
+          version="${{ needs.prepare.outputs.version }}"
+          if gh release view "${tag}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "${tag}" dist/* --clobber --repo "${{ github.repository }}"
+          else
+            gh release create "${tag}" dist/* \
+              --repo "${{ github.repository }}" \
+              --target "${{ github.sha }}" \
+              --title "${BIN} ${version}" \
+              --generate-notes
+          fi
+          gh release view "${tag}" --repo "${{ github.repository }}" --json assets --jq '.assets[].name'
