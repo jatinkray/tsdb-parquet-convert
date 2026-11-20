@@ -62,7 +62,7 @@ tsdb2parqtel schema /var/lib/prometheus/blocks --out schema.yaml
 ```
 
 Edit it (`--max-labels N`, `--no-labels` and `--name` control the generated
-file), then convert:
+file), or start from `examples/schema-labelled.yaml`, then convert:
 
 ```bash
 tsdb2parqtel convert /var/lib/prometheus/blocks \

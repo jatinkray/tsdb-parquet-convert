@@ -1,4 +1,9 @@
-# Verification report
+# Verification report — `tsdb2parqtel`
+
+Status: verified at 2026-11-20.
+
+Every row below was run on the tree it describes; commands are quoted as
+executed. The report does not restate the design or the loss list.
 
 ## Source and target
 
@@ -39,7 +44,10 @@
 | schema round trip | `cargo test -p parquet-sink --test roundtrip` | pass: 5 tests (types, NULL labels, cast errors, embedded schema, empty file) |
 | schema end to end | `schema <fixture> --out /tmp/schema.yaml` then `convert <fixture> --out /tmp/schema-out --schema /tmp/schema.yaml` | 5,550,882 rows in 6 files |
 | schema read back | pyarrow 26.0.1 over the 6 files | 9 columns, declared nullability, labels/timestamps/values correct |
-| schema flag guards | `convert --schema ... --sidecar`, `--metadata-file`, `--label-mode otel` | exit 1 with the documented message |
+| schema flag guards | `convert --schema ... --sidecar`, `--metadata-file`, `--label-mode otel`, `--label-mapping`, `--target-retention-days` | exit 1 with the documented message |
+| example schema | `convert <fixture> --out /tmp --schema examples/schema-labelled.yaml` | 5,550,882 rows, 6 files, 0 errors |
+| release workflow | push to `main` on an unreleased version | run 44789349646 published `v0.1.0`: 5 archives + `SHA256SUMS` |
+| release artifact | `gh release download v0.1.0` then `sha256sum -c` | checksums OK; `x86_64-unknown-linux-musl` binary is static-pie and reports `0.1.0` |
 
 The files-mode block was opened by a real Parqtel debug server with
 `PARQTEL__STORAGE__DATA_DIR` pointed at the output directory; `/ready` returned

@@ -246,6 +246,17 @@ fn schema_is_embedded_in_file_metadata() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn repository_example_schema_stays_valid() -> Result<(), Box<dyn Error>> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/schema-labelled.yaml");
+    let spec = SchemaSpec::from_path(&path)?;
+    assert_eq!(spec.name.as_deref(), Some("tsdb_labelled"));
+    assert_eq!(spec.columns.len(), 11);
+    assert!(spec.columns.iter().any(|column| column.name == "series"));
+    Ok(())
+}
+
+#[test]
 fn refuses_empty_file() -> Result<(), Box<dyn Error>> {
     let spec = SchemaSpec::from_str(SPEC)?;
     let writer = BlockWriter::new(spec, WriteOptions::default())?;

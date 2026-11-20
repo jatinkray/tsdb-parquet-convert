@@ -42,6 +42,10 @@ error rather than ignored: `--sidecar`, `--label-mode otel`, `--label-mapping`,
 
 ## Example
 
+The repository ships a validated example, `examples/schema-labelled.yaml` (a
+test in `crates/parquet-sink/tests/roundtrip.rs` keeps it loadable). A smaller
+one:
+
 ```yaml
 version: 1
 name: tsdb_labelled

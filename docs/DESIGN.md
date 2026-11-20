@@ -1,7 +1,8 @@
 # Design — `tsdb2parqtel`
 
-Status: implemented; source audited at
-`parqtel-oss@63a9cf1cdc9e8cc4855565b6d0b67fa6c366cef4`.
+Status: implemented; Parqtel source audited at
+`parqtel-oss@63a9cf1cdc9e8cc4855565b6d0b67fa6c366cef4`; schema-driven output
+added and verified 2026-11-20.
 
 The source tree is canonical. This document records what the code does, where
 the docs disagree, and the lossy cases that are intentionally rejected or

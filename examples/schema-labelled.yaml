@@ -1,0 +1,56 @@
+# Example schema for `tsdb2parqtel convert --schema`.
+#
+# One row per sample: the series identity is flattened into columns, so a
+# Parquet reader or SQL engine can group and filter without decoding a series
+# index. Start from `tsdb2parqtel schema <source>` and edit from there; the
+# format is documented in docs/SCHEMA.md.
+version: 1
+name: tsdb_labelled
+description: Prometheus/Thanos series flattened to labelled Parquet rows
+columns:
+  - name: timestamp
+    type: timestamp_ms
+    source: timestamp
+    timezone: UTC
+    description: sample timestamp
+  - name: metric
+    type: utf8
+    source: metric_name
+    description: "__name__ of the series"
+  - name: value
+    type: float64
+    source: value
+    description: sample value
+  - name: job
+    type: utf8
+    source: label:job
+    nullable: true
+  - name: instance
+    type: utf8
+    source: label:instance
+    nullable: true
+  - name: namespace
+    type: utf8
+    source: label:namespace
+    nullable: true
+  - name: pod
+    type: utf8
+    source: label:pod
+    nullable: true
+  - name: container
+    type: utf8
+    source: label:container
+    nullable: true
+  - name: le
+    type: utf8
+    source: label:le
+    nullable: true
+    description: histogram bucket bound, kept as text because `+Inf` is not a number
+  - name: series
+    type: uint64
+    source: series_fingerprint
+    description: stable xxHash3 of the label set
+  - name: block
+    type: utf8
+    source: block_ulid
+    description: source block ULID
