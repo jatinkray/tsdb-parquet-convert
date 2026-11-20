@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.89"
 license = "Apache-2.0"
@@ -19,10 +19,10 @@ description = "Convert Prometheus/Thanos TSDB blocks into Parqtel-compatible Par
 # Internal crates: `version` is required next to `path` so cargo-deny's
 # `wildcards = "deny"` policy keeps passing, and it lives here only, so a
 # release bump is `[workspace.package] version` plus these four lines.
-tsdb-reader = { path = "crates/tsdb-reader", version = "0.2.0" }
-parqtel-sink = { path = "crates/parqtel-sink", version = "0.2.0" }
-parquet-sink = { path = "crates/parquet-sink", version = "0.2.0" }
-otlp-sink = { path = "crates/otlp-sink", version = "0.2.0" }
+tsdb-reader = { path = "crates/tsdb-reader", version = "1.0.0" }
+parqtel-sink = { path = "crates/parqtel-sink", version = "1.0.0" }
+parquet-sink = { path = "crates/parquet-sink", version = "1.0.0" }
+otlp-sink = { path = "crates/otlp-sink", version = "1.0.0" }
 tokio = { version = "1", features = ["full"] }
 arrow = { version = "60", features = ["ipc", "json", "csv", "prettyprint"] }
 parquet = { version = "60", features = ["zstd", "async", "encryption"] }

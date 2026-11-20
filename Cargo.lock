@@ -1803,7 +1803,7 @@ dependencies = [
 
 [[package]]
 name = "otlp-sink"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1873,7 +1873,7 @@ dependencies = [
 
 [[package]]
 name = "parqtel-sink"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "arrow",
  "parqtel-core",
@@ -1921,7 +1921,7 @@ dependencies = [
 
 [[package]]
 name = "parquet-sink"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3088,7 +3088,7 @@ dependencies = [
 
 [[package]]
 name = "tsdb-reader"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "crc32c",
  "criterion",
@@ -3109,7 +3109,7 @@ dependencies = [
 
 [[package]]
 name = "tsdb2parqtel"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -3132,7 +3132,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "tsdb-reader 0.2.0",
+ "tsdb-reader 1.0.0",
  "url",
  "walkdir",
  "xxhash-rust",
