@@ -268,6 +268,11 @@ and its name/description/version are stored in the Parquet key-value metadata,
 and every Arrow field carries `tsdb2parqtel.source` so a reader can tell how the
 column was produced.
 
+One column per label matches the layout used by
+`prometheus-community/parquet-common`, whose label projection is also one
+column per label name (prefixed `l_`) with Parquet dictionary encoding; the
+prefix is not imposed here because the schema names the columns.
+
 ### 10.5 Verification boundary
 
 `verify` reconciles Parqtel output; it has no schema-mode equivalent, because a
