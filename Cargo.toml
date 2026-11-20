@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/tsdb-reader",
     "crates/parqtel-sink",
+    "crates/parquet-sink",
     "crates/otlp-sink",
     "crates/cli",
 ]
