@@ -593,7 +593,10 @@ fn build_convert_options(
         for (flag, given) in [
             ("--label-mapping", output.label_mapping.is_some()),
             ("--metadata-file", output.metadata_file.is_some()),
-            ("--target-retention-days", output.target_retention_days.is_some()),
+            (
+                "--target-retention-days",
+                output.target_retention_days.is_some(),
+            ),
         ] {
             if given {
                 anyhow::bail!(
@@ -915,5 +918,84 @@ fn parse_time(value: &str) -> Result<i64> {
         Ok(numeric as i64)
     } else {
         Ok((numeric * 1_000) as i64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn counts(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), *value))
+            .collect()
+    }
+
+    #[test]
+    fn starter_schema_orders_labels_by_series_count() -> Result<()> {
+        let spec = starter_schema(
+            "test",
+            &counts(&[("job", 10), ("instance", 30), ("__name__", 99)]),
+            false,
+            0,
+        )?;
+        let names: Vec<&str> = spec
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["timestamp", "metric", "value", "instance", "job"]
+        );
+        assert!(spec.columns[3].nullable);
+        assert_eq!(spec.columns[3].source, "label:instance");
+        Ok(())
+    }
+
+    #[test]
+    fn starter_schema_sanitizes_label_keys() -> Result<()> {
+        let spec = starter_schema(
+            "test",
+            &counts(&[
+                ("k8s.pod.name", 5),
+                ("k8s.pod_name", 4),
+                ("0weird", 3),
+                ("dash-name", 2),
+            ]),
+            false,
+            0,
+        )?;
+        let names: Vec<&str> = spec
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "timestamp",
+                "metric",
+                "value",
+                "k8s_pod_name",
+                "k8s_pod_name_2",
+                "label_0weird",
+                "dash_name"
+            ]
+        );
+        assert_eq!(spec.columns[3].source, "label:k8s.pod.name");
+        assert_eq!(spec.columns[4].source, "label:k8s.pod_name");
+        Ok(())
+    }
+
+    #[test]
+    fn starter_schema_honours_flags() -> Result<()> {
+        let labels = counts(&[("job", 1)]);
+        let no_labels = starter_schema("test", &labels, true, 0)?;
+        assert_eq!(no_labels.columns.len(), 3);
+        let limited = starter_schema("test", &labels, false, 1)?;
+        assert_eq!(limited.columns.len(), 4);
+        Ok(())
     }
 }
