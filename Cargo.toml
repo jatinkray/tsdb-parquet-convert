@@ -39,7 +39,7 @@ serde_yaml = "0.9"
 walkdir = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 rayon = "1"
-reqwest = { version = "0.12", features = ["json", "blocking", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 bytes = "1"
 object_store = { version = "0.14", features = ["aws", "gcp", "azure"] }
