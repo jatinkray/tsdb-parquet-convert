@@ -1,0 +1,12 @@
+# Runtime image built from an already-compiled release binary.
+#
+# The release workflow unpacks the static musl archive into the build context
+# and builds this per architecture, so the container and the release archive
+# ship the same executable. distroless/static carries CA certificates and a
+# nonroot user; the binary is static-pie, so no libc is needed.
+FROM gcr.io/distroless/static-debian12:nonroot
+ARG BINARY=tsdb2parqtel
+COPY ${BINARY} /usr/local/bin/tsdb2parqtel
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/tsdb2parqtel"]
+CMD ["--help"]

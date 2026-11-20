@@ -4,7 +4,35 @@
 Parquet blocks, writes ordinary Parquet for a schema you supply, or replays the
 same series into a running Parqtel over OTLP/HTTP.
 
-Build:
+## Install
+
+Every release publishes static binaries for Linux (x86_64, aarch64, musl),
+macOS (Intel, Apple silicon) and Windows, plus `SHA256SUMS`; the container image
+is on GitHub Container Registry.
+
+```bash
+# Prebuilt archive (pick the asset for your platform)
+gh release download v0.2.0 --pattern '*x86_64-unknown-linux-musl.tar.gz'
+tar -xzf tsdb2parqtel-0.2.0-x86_64-unknown-linux-musl.tar.gz
+./tsdb2parqtel --version
+
+# Container
+docker run --rm ghcr.io/jatinkray/tsdb-parquet-convert:latest --version
+
+# From source
+cargo install --git https://github.com/jatinkray/tsdb-parquet-convert tsdb2parqtel
+```
+
+Homebrew users render a formula from the release checksums (no tap is
+published):
+
+```bash
+python3 scripts/render_homebrew_formula.py 0.2.0 SHA256SUMS \
+  https://github.com/jatinkray/tsdb-parquet-convert/releases/download > tsdb2parqtel.rb
+brew install --formula ./tsdb2parqtel.rb
+```
+
+Build from a checkout:
 
 ```bash
 cargo build --release

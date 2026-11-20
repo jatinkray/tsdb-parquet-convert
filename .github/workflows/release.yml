@@ -146,6 +146,57 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  container:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: "${{ env.BIN }}-${{ needs.prepare.outputs.version }}-*-linux-musl"
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push one image per architecture
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          image="ghcr.io/${{ github.repository }}"
+          for pair in x86_64:amd64 aarch64:arm64; do
+            target="${pair%%:*}"
+            platform="${pair##*:}"
+            work="ctx-${platform}"
+            rm -rf "${work}" && mkdir -p "${work}"
+            tar -xzf "dist/${BIN}-${version}-${target}-unknown-linux-musl.tar.gz" -C "${work}"
+            docker buildx build \
+              --platform "linux/${platform}" \
+              --build-arg "BINARY=${BIN}" \
+              --file deploy/Dockerfile.binary \
+              --tag "${image}:${version}-${platform}" \
+              --push "${work}"
+          done
+      - name: Merge into version and latest tags
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          image="ghcr.io/${{ github.repository }}"
+          docker buildx imagetools create \
+            --tag "${image}:${version}" \
+            --tag "${image}:latest" \
+            "${image}:${version}-amd64" \
+            "${image}:${version}-arm64"
+          docker buildx imagetools inspect "${image}:${version}"
+
   release:
     needs: [prepare, build]
     if: needs.prepare.outputs.should_release == 'true'
