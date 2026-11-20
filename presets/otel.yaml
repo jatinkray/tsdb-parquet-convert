@@ -1,0 +1,45 @@
+# The labels OTel-instrumented services usually carry after OTel-to-Prometheus
+# translation, flattened to columns so a lakehouse query needs no label parse.
+# Every correlation column is nullable: plain Prometheus series simply have
+# no value there.
+version: 1
+name: tsdb_otel
+description: metrics with OTel resource correlation as columns
+columns:
+  - name: timestamp
+    type: timestamp_ms
+    source: timestamp
+    timezone: UTC
+  - name: metric
+    type: utf8
+    source: metric_name
+  - name: value
+    type: float64
+    source: value
+  - name: series_fingerprint
+    type: uint64
+    source: series_fingerprint
+  - name: service_name
+    type: utf8
+    source: label:service_name
+    nullable: true
+  - name: service_version
+    type: utf8
+    source: label:service_version
+    nullable: true
+  - name: k8s_namespace_name
+    type: utf8
+    source: label:k8s_namespace_name
+    nullable: true
+  - name: k8s_pod_name
+    type: utf8
+    source: label:k8s_pod_name
+    nullable: true
+  - name: k8s_container_name
+    type: utf8
+    source: label:k8s_container_name
+    nullable: true
+  - name: k8s_node_name
+    type: utf8
+    source: label:k8s_node_name
+    nullable: true

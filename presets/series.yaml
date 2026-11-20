@@ -1,0 +1,19 @@
+# Time, metric name, value and series identity: enough to group by metric and
+# to reconcile with `verify --preset series`, without copying every label.
+version: 1
+name: tsdb_series
+description: labelled samples keyed by metric name and series fingerprint
+columns:
+  - name: timestamp
+    type: timestamp_ms
+    source: timestamp
+    timezone: UTC
+  - name: metric
+    type: utf8
+    source: metric_name
+  - name: value
+    type: float64
+    source: value
+  - name: series_fingerprint
+    type: uint64
+    source: series_fingerprint

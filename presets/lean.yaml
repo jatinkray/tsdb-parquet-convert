@@ -1,0 +1,18 @@
+# Smallest useful export: time, value, series identity.
+# Pair with `verify --preset lean` for a bit-exact round-trip check.
+version: 1
+name: tsdb_lean
+description: sample rows with the series fingerprint and nothing else
+columns:
+  - name: timestamp
+    type: timestamp_ms
+    source: timestamp
+    timezone: UTC
+    description: sample timestamp in milliseconds since the Unix epoch
+  - name: value
+    type: float64
+    source: value
+  - name: series_fingerprint
+    type: uint64
+    source: series_fingerprint
+    description: stable xxHash3 of the label set

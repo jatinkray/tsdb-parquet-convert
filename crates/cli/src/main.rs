@@ -3,6 +3,7 @@
 mod convert;
 mod labels;
 mod metadata;
+mod presets;
 mod verify;
 
 use anyhow::{Context, Result};
@@ -55,6 +56,8 @@ enum Commands {
     Convert(ConvertArgs),
     /// Print a starter schema file for a source (one column per label).
     Schema(SchemaArgs),
+    /// List the built-in schemas accepted by `--preset`.
+    Presets,
     /// Convert and install into a Parqtel data directory or replay over OTLP.
     Clone(CloneArgs),
     /// Reconcile source and converted blocks per series.
@@ -223,6 +226,13 @@ struct ConvertArgs {
         help = "Write Parquet for this schema file (YAML/JSON) instead of Parqtel blocks"
     )]
     schema: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "NAME",
+        conflicts_with = "schema",
+        help = "Use a built-in schema instead of a file (see `tsdb2parqtel presets`)"
+    )]
+    preset: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -270,6 +280,9 @@ struct VerifyArgs {
     /// Verify schema-mode Parquet output against this schema file.
     #[arg(long, value_name = "FILE")]
     schema: Option<PathBuf>,
+    /// Verify against a built-in schema (see `tsdb2parqtel presets`).
+    #[arg(long, value_name = "NAME", conflicts_with = "schema")]
+    preset: Option<String>,
     #[arg(long)]
     json: bool,
     #[arg(long)]
@@ -316,6 +329,10 @@ fn run(cli: Cli) -> Result<i32> {
         Commands::Plan(args) => plan(args, cli.progress),
         Commands::Convert(args) => run_convert(args, dry_run, cli.progress),
         Commands::Schema(args) => generate_schema(args),
+        Commands::Presets => {
+            println!("{}", presets::listing());
+            Ok(0)
+        }
         Commands::Clone(args) => clone(args, dry_run, cli.progress),
         Commands::Verify(args) => run_verify(args),
     }
@@ -434,7 +451,7 @@ fn run_convert(args: ConvertArgs, dry_run: bool, progress: bool) -> Result<i32> 
         args.out.clone(),
         dry_run,
         args.sidecar,
-        args.schema,
+        resolve_schema(args.schema, args.preset)?,
         progress,
     )?;
     let report = convert(&options)?;
@@ -572,13 +589,31 @@ fn unique_column_name(key: &str, used: &mut std::collections::BTreeSet<String>) 
     candidate
 }
 
+/// A schema either comes from a file or from the built-in presets; `clap`
+/// rejects both at once.
+fn resolve_schema(
+    schema: Option<PathBuf>,
+    preset: Option<String>,
+) -> Result<Option<parquet_sink::SchemaSpec>> {
+    match (schema, preset) {
+        (Some(path), None) => Ok(Some(
+            parquet_sink::SchemaSpec::from_path(&path)
+                .map_err(|error| anyhow::anyhow!("{error}"))
+                .with_context(|| format!("loading schema {}", path.display()))?,
+        )),
+        (None, Some(name)) => Ok(Some(presets::load(&name)?)),
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => anyhow::bail!("--schema and --preset cannot be combined"),
+    }
+}
+
 fn build_convert_options(
     source: SourceArgs,
     output: OutputArgs,
     out_dir: PathBuf,
     dry_run: bool,
     sidecar: bool,
-    schema: Option<PathBuf>,
+    schema: Option<parquet_sink::SchemaSpec>,
     progress: bool,
 ) -> Result<ConvertOptions> {
     if schema.is_some() {
@@ -608,14 +643,6 @@ fn build_convert_options(
             }
         }
     }
-    let schema = match schema {
-        Some(path) => Some(
-            parquet_sink::SchemaSpec::from_path(&path)
-                .map_err(|error| anyhow::anyhow!("{error}"))
-                .with_context(|| format!("loading schema {}", path.display()))?,
-        ),
-        None => None,
-    };
     Ok(ConvertOptions {
         source: source.to_options()?,
         out_dir,
@@ -687,15 +714,15 @@ fn run_verify(args: VerifyArgs) -> Result<i32> {
         label_mapper: args.output.mapper()?,
     };
     let live = args.target.starts_with("http://") || args.target.starts_with("https://");
-    let report = if let Some(schema_path) = args.schema.as_deref() {
+    let schema_mode = args.schema.is_some() || args.preset.is_some();
+    let report = if schema_mode {
         if live {
             anyhow::bail!(
                 "--schema verifies Parquet files; a live URL is reconciled by the Parqtel path"
             );
         }
-        let spec = parquet_sink::SchemaSpec::from_path(schema_path)
-            .map_err(|error| anyhow::anyhow!("{error}"))
-            .with_context(|| format!("loading schema {}", schema_path.display()))?;
+        let spec = resolve_schema(args.schema, args.preset)?
+            .context("a schema or preset is required for schema-mode verification")?;
         verify_schema(&options, &spec, Path::new(&args.target))?
     } else if live {
         verify_live(&options, &args.target)?
