@@ -590,6 +590,17 @@ fn build_convert_options(
                 output.label_mode
             );
         }
+        for (flag, given) in [
+            ("--label-mapping", output.label_mapping.is_some()),
+            ("--metadata-file", output.metadata_file.is_some()),
+            ("--target-retention-days", output.target_retention_days.is_some()),
+        ] {
+            if given {
+                anyhow::bail!(
+                    "{flag} only affects Parqtel blocks; remove it when using --schema so nothing is silently ignored"
+                );
+            }
+        }
     }
     let schema = match schema {
         Some(path) => Some(
