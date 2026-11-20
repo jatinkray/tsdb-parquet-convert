@@ -8,17 +8,17 @@ pub const PRESETS: &[(&str, &str, &str)] = &[
     (
         "lean",
         "timestamp, value and series fingerprint: the smallest export",
-        include_str!("../../../presets/lean.yaml"),
+        include_str!("../presets/lean.yaml"),
     ),
     (
         "series",
         "adds the metric name to `lean`",
-        include_str!("../../../presets/series.yaml"),
+        include_str!("../presets/series.yaml"),
     ),
     (
         "otel",
         "adds nullable OTel resource columns (service, k8s) to `series`",
-        include_str!("../../../presets/otel.yaml"),
+        include_str!("../presets/otel.yaml"),
     ),
 ];
 
