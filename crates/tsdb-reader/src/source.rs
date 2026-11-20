@@ -269,6 +269,21 @@ impl Source {
             .collect()
     }
 
+    /// Label names present in the selected blocks, with the number of series
+    /// that carry each one. Index-only: no chunk data is decoded. Thanos
+    /// external labels are not included because they are added at scan time.
+    pub fn label_names(&self) -> BTreeMap<String, u64> {
+        let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+        for block in &self.blocks {
+            for series in block.series() {
+                for key in series.labels.keys() {
+                    *counts.entry(key.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        counts
+    }
+
     pub fn block_count(&self) -> usize {
         self.blocks.len()
     }

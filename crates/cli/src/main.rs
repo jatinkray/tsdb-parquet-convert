@@ -51,8 +51,10 @@ enum Commands {
     Inspect(InspectArgs),
     /// Dry run: windows, mapping preview, retention check.
     Plan(PlanArgs),
-    /// Produce Parqtel metric blocks.
+    /// Produce Parqtel metric blocks, or Parquet for --schema.
     Convert(ConvertArgs),
+    /// Print a starter schema file for a source (one column per label).
+    Schema(SchemaArgs),
     /// Convert and install into a Parqtel data directory or replay over OTLP.
     Clone(CloneArgs),
     /// Reconcile source and converted blocks per series.
@@ -165,6 +167,14 @@ impl OutputArgs {
         Ok(config)
     }
 
+    fn parquet_options(&self) -> parquet_sink::WriteOptions {
+        parquet_sink::WriteOptions {
+            compression: self.compression.clone(),
+            compression_level: self.compression_level,
+            row_group_size: self.row_group_size,
+        }
+    }
+
     fn mapper(&self) -> Result<LabelMapper> {
         LabelMapper::new(
             LabelMode::parse(&self.label_mode)?,
@@ -207,6 +217,30 @@ struct ConvertArgs {
     output: OutputArgs,
     #[arg(long, help = "Write index.fragment.json for the output blocks")]
     sidecar: bool,
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Write Parquet for this schema file (YAML/JSON) instead of Parqtel blocks"
+    )]
+    schema: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct SchemaArgs {
+    #[command(flatten)]
+    source: SourceArgs,
+    /// Write the schema here; stdout when omitted.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Schema name recorded in the file and the Parquet metadata.
+    #[arg(long, default_value = "tsdb_generic")]
+    name: String,
+    /// Emit only timestamp, metric_name and value.
+    #[arg(long)]
+    no_labels: bool,
+    /// Keep this many label columns, highest series count first (0 = all).
+    #[arg(long, default_value_t = 0)]
+    max_labels: usize,
 }
 
 #[derive(Debug, Args)]
@@ -278,6 +312,7 @@ fn run(cli: Cli) -> Result<i32> {
         Commands::Inspect(args) => inspect(args),
         Commands::Plan(args) => plan(args, cli.progress),
         Commands::Convert(args) => run_convert(args, dry_run, cli.progress),
+        Commands::Schema(args) => generate_schema(args),
         Commands::Clone(args) => clone(args, dry_run, cli.progress),
         Commands::Verify(args) => run_verify(args),
     }
@@ -381,6 +416,7 @@ fn plan(args: PlanArgs, progress: bool) -> Result<i32> {
         PathBuf::new(),
         true,
         false,
+        None,
         progress,
     )?;
     let report = convert(&options)?;
@@ -395,6 +431,7 @@ fn run_convert(args: ConvertArgs, dry_run: bool, progress: bool) -> Result<i32> 
         args.out.clone(),
         dry_run,
         args.sidecar,
+        args.schema,
         progress,
     )?;
     let report = convert(&options)?;
@@ -408,14 +445,160 @@ fn run_convert(args: ConvertArgs, dry_run: bool, progress: bool) -> Result<i32> 
     })
 }
 
+fn generate_schema(args: SchemaArgs) -> Result<i32> {
+    let source = Source::open(args.source.to_options()?)?;
+    let labels = source.label_names();
+    let spec = starter_schema(&args.name, &labels, args.no_labels, args.max_labels)?;
+    let text = serde_yaml::to_string(&spec)?;
+    match args.out {
+        Some(path) => {
+            std::fs::write(&path, text)
+                .with_context(|| format!("writing schema {}", path.display()))?;
+            println!("wrote {}", path.display());
+        }
+        None => print!("{text}"),
+    }
+    Ok(0)
+}
+
+/// Builds the starter schema: fixed timestamp/metric/value columns plus one
+/// nullable utf8 column per label, ordered by how many series carry the label.
+fn starter_schema(
+    name: &str,
+    labels: &BTreeMap<String, u64>,
+    no_labels: bool,
+    max_labels: usize,
+) -> Result<parquet_sink::SchemaSpec> {
+    let mut columns = vec![
+        parquet_sink::ColumnSpec {
+            name: "timestamp".to_string(),
+            column_type: parquet_sink::ColumnType::TimestampMs,
+            source: "timestamp".to_string(),
+            nullable: false,
+            precision: None,
+            scale: None,
+            timezone: None,
+            description: Some("sample timestamp, milliseconds since the Unix epoch".to_string()),
+        },
+        parquet_sink::ColumnSpec {
+            name: "metric".to_string(),
+            column_type: parquet_sink::ColumnType::Utf8,
+            source: "metric_name".to_string(),
+            nullable: false,
+            precision: None,
+            scale: None,
+            timezone: None,
+            description: Some("`__name__` of the series".to_string()),
+        },
+        parquet_sink::ColumnSpec {
+            name: "value".to_string(),
+            column_type: parquet_sink::ColumnType::Float64,
+            source: "value".to_string(),
+            nullable: false,
+            precision: None,
+            scale: None,
+            timezone: None,
+            description: None,
+        },
+    ];
+    if !no_labels {
+        let mut ordered: Vec<(&String, &u64)> = labels
+            .iter()
+            .filter(|(key, _)| key.as_str() != "__name__")
+            .collect();
+        ordered.sort_by(|(left_name, left_count), (right_name, right_count)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_name.cmp(right_name))
+        });
+        if max_labels > 0 {
+            ordered.truncate(max_labels);
+        }
+        let mut used: std::collections::BTreeSet<String> =
+            columns.iter().map(|column| column.name.clone()).collect();
+        for (key, _) in ordered {
+            let column_name = unique_column_name(key, &mut used);
+            columns.push(parquet_sink::ColumnSpec {
+                name: column_name,
+                column_type: parquet_sink::ColumnType::Utf8,
+                source: format!("label:{key}"),
+                nullable: true,
+                precision: None,
+                scale: None,
+                timezone: None,
+                description: Some(format!("label `{key}`")),
+            });
+        }
+    }
+    let spec = parquet_sink::SchemaSpec {
+        version: parquet_sink::CURRENT_VERSION,
+        name: Some(name.to_string()),
+        description: Some(
+            "starter schema generated by `tsdb2parqtel schema`; edit the columns before converting"
+                .to_string(),
+        ),
+        columns,
+    };
+    spec.validate()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok(spec)
+}
+
+/// Parquet readers treat `.` as a nested-field separator, so label keys become
+/// snake_case identifiers; collisions get a numeric suffix.
+fn unique_column_name(key: &str, used: &mut std::collections::BTreeSet<String>) -> String {
+    let mut base: String = key
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if base.is_empty() || base.starts_with(|character: char| character.is_ascii_digit()) {
+        base.insert_str(0, "label_");
+    }
+    let mut candidate = base.clone();
+    let mut suffix = 2;
+    while !used.insert(candidate.clone()) {
+        candidate = format!("{base}_{suffix}");
+        suffix += 1;
+    }
+    candidate
+}
+
 fn build_convert_options(
     source: SourceArgs,
     output: OutputArgs,
     out_dir: PathBuf,
     dry_run: bool,
     sidecar: bool,
+    schema: Option<PathBuf>,
     progress: bool,
 ) -> Result<ConvertOptions> {
+    if schema.is_some() {
+        if sidecar {
+            anyhow::bail!(
+                "--sidecar writes a Parqtel index fragment and cannot be combined with --schema"
+            );
+        }
+        if output.label_mode != "preserve" {
+            anyhow::bail!(
+                "--label-mode {} rewrites Parqtel correlation columns; --schema reads the raw series labels, so leave label-mode at `preserve`",
+                output.label_mode
+            );
+        }
+    }
+    let schema = match schema {
+        Some(path) => Some(
+            parquet_sink::SchemaSpec::from_path(&path)
+                .map_err(|error| anyhow::anyhow!("{error}"))
+                .with_context(|| format!("loading schema {}", path.display()))?,
+        ),
+        None => None,
+    };
     Ok(ConvertOptions {
         source: source.to_options()?,
         out_dir,
@@ -425,6 +608,8 @@ fn build_convert_options(
         label_mapper: output.mapper()?,
         metadata: output.metadata()?,
         write_sidecar: sidecar,
+        schema,
+        parquet: output.parquet_options(),
         dry_run,
         target_retention_days: output.target_retention_days,
         retention_refuse: output.retention_action == "refuse",
@@ -438,6 +623,7 @@ fn print_report(report: &ConvertReport, as_json: bool) -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&json!({
                 "blocks": report.blocks.len(),
+                "files": report.files.len(),
                 "rows": report.total_rows,
                 "windows": report.windows,
                 "preview": report.preview,
@@ -449,9 +635,10 @@ fn print_report(report: &ConvertReport, as_json: bool) -> Result<()> {
         );
     } else {
         println!(
-            "windows={} blocks={} rows={} errors={}",
+            "windows={} blocks={} files={} rows={} errors={}",
             report.windows.len(),
             report.blocks.len(),
+            report.files.len(),
             report.total_rows,
             report.stats.errors.len()
         );
@@ -546,6 +733,7 @@ fn clone(args: CloneArgs, dry_run: bool, progress: bool) -> Result<i32> {
         out_dir.clone(),
         dry_run,
         false,
+        None,
         progress,
     )?;
     let mut report = convert(&options)?;

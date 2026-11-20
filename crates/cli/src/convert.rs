@@ -1,16 +1,17 @@
 //! Streaming source → Parqtel block conversion.
 
-use crate::labels::{LabelMapper, MappedLabels};
+use crate::labels::LabelMapper;
 use crate::metadata::Metadata;
 use anyhow::{Context, Result};
 use parqtel_sink::{
-    write_metric_block, write_sidecar_fragment, BlockFile, BlockSpec, DataPoint, LabelSet,
-    MetricKind, MetricValue, SeriesData, WriterConfig,
+    write_metric_block, write_sidecar_fragment, BlockFile, BlockSpec, DataPoint, MetricValue,
+    SeriesData, WriterConfig,
 };
+use parquet_sink::{BlockWriter, FileInfo, SchemaSpec, SeriesInput, WriteOptions};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use tsdb_reader::{ScanStats, SeriesRecord, Source, SourceOptions};
+use tsdb_reader::{Labels, ScanStats, SeriesRecord, Source, SourceOptions};
 
 #[derive(Debug, Clone)]
 pub struct ConvertOptions {
@@ -22,6 +23,11 @@ pub struct ConvertOptions {
     pub label_mapper: LabelMapper,
     pub metadata: Metadata,
     pub write_sidecar: bool,
+    /// When set, rows are written through `parquet-sink` for this schema and
+    /// the Parqtel block writer is not used.
+    pub schema: Option<SchemaSpec>,
+    /// Settings for the schema-driven writer.
+    pub parquet: WriteOptions,
     pub dry_run: bool,
     pub target_retention_days: Option<u64>,
     pub retention_refuse: bool,
@@ -41,6 +47,8 @@ pub struct WindowPlan {
 pub struct ConvertReport {
     pub stats: ScanStats,
     pub blocks: Vec<BlockFile>,
+    /// Files written by the schema-driven writer.
+    pub files: Vec<FileInfo>,
     pub windows: Vec<WindowPlan>,
     pub total_rows: usize,
     pub preview: Vec<String>,
@@ -58,17 +66,15 @@ struct WindowKey {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SeriesKey {
     metric: String,
-    kind: MetricKind,
-    resource_json: String,
     fingerprint: u64,
 }
 
 #[derive(Debug)]
 struct SeriesAccum {
     metric_name: String,
-    kind: MetricKind,
-    resource: LabelSet,
-    points: Vec<DataPoint>,
+    labels: Labels,
+    /// `(timestamp_ns, value)` in source order.
+    samples: Vec<(i64, f64)>,
 }
 
 #[derive(Debug, Default)]
@@ -159,7 +165,10 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertReport> {
             .collect();
         report.sidecar = Some(write_sidecar_fragment(&options.out_dir, &metadata)?);
     }
-    if let Some(days) = options.target_retention_days {
+    if let Some(days) = options
+        .target_retention_days
+        .filter(|_| options.schema.is_none())
+    {
         if let Some(oldest) = report.windows.iter().map(|window| window.start_ns).min() {
             let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
             let cutoff = now_ns.saturating_sub(
@@ -218,6 +227,7 @@ fn convert_one_window(
 fn merge_report(total: &mut ConvertReport, mut part: ConvertReport) {
     merge_stats(&mut total.stats, part.stats);
     total.blocks.append(&mut part.blocks);
+    total.files.append(&mut part.files);
     total.windows.append(&mut part.windows);
     total.total_rows += part.total_rows;
     total.preview.append(&mut part.preview);
@@ -244,20 +254,18 @@ fn append_record(
     let Some(metric_name) = record.metric_name().map(str::to_string) else {
         return Ok(());
     };
-    let kind = options.metadata.kind_for(&metric_name);
-    let MappedLabels { labels, resource } = options.label_mapper.map(&record.labels)?;
-    let resource_json = resource.json_str().to_string();
+    let fingerprint = fingerprint(&record.labels);
     let key = SeriesKey {
         metric: metric_name.clone(),
-        kind,
-        resource_json,
-        fingerprint: labels.fingerprint(),
+        fingerprint,
     };
     if report.preview.len() < 10 {
+        let mapped = options.label_mapper.map(&record.labels)?;
         report.preview.push(format!(
             "{}{{{}}}",
             metric_name,
-            labels
+            mapped
+                .labels
                 .iter()
                 .map(|(key, value)| format!("{key}={value:?}"))
                 .collect::<Vec<_>>()
@@ -286,23 +294,16 @@ fn append_record(
                 rows: 0,
                 series: BTreeMap::new(),
             });
-        let point = DataPoint::new(
-            timestamp_ns,
-            MetricValue::Double(sample.value),
-            labels.clone(),
-        )
-        .map_err(|e| anyhow::anyhow!("building data point: {e}"))?;
         state
             .series
             .entry(key.clone())
             .or_insert_with(|| SeriesAccum {
                 metric_name: metric_name.clone(),
-                kind,
-                resource: resource.clone(),
-                points: Vec::new(),
+                labels: record.labels.clone(),
+                samples: Vec::new(),
             })
-            .points
-            .push(point);
+            .samples
+            .push((timestamp_ns, sample.value));
         state.rows += 1;
         report.total_rows += 1;
         if state.rows >= options.max_rows_per_block {
@@ -335,30 +336,74 @@ fn flush_window(
     };
     report.windows.push(plan);
 
-    let series: Vec<SeriesData> = state
-        .series
-        .into_values()
-        .map(|series| SeriesData {
-            metric_name: series.metric_name,
-            kind: series.kind,
-            resource: series.resource,
-            points: series.points,
-        })
-        .collect();
-    if !options.dry_run {
-        let block = write_metric_block(
-            &options.out_dir,
-            &BlockSpec {
-                source_id: key.block_ulid.clone(),
-                window_start_ns: state.start_ns,
-                window_end_ns: state.end_ns,
-                part: *part,
-            },
-            series,
-            &options.writer,
-        )?;
-        report.blocks.push(block);
+    if let Some(schema) = &options.schema {
+        let mut writer = BlockWriter::new(schema.clone(), options.parquet.clone())?;
+        for (index, series) in state.series.into_iter().enumerate() {
+            writer.push_series(SeriesInput {
+                block_ulid: &key.block_ulid,
+                series_fingerprint: series.0.fingerprint,
+                series_index: index as u64,
+                metric_name: Some(series.1.metric_name.as_str()),
+                labels: &series.1.labels,
+                samples: &series.1.samples,
+            })?;
+        }
+        let filename = parquet_sink::block_filename(state.start_ns, state.end_ns, *part);
+        if !options.dry_run {
+            let file = writer.write(&options.out_dir.join(&filename))?;
+            report.files.push(file);
+        }
+    } else {
+        let series: Vec<SeriesData> = state
+            .series
+            .into_values()
+            .map(|series| -> Result<SeriesData> {
+                let mapped = options.label_mapper.map(&series.labels)?;
+                let mut points = Vec::with_capacity(series.samples.len());
+                for (timestamp_ns, value) in series.samples {
+                    let point = DataPoint::new(
+                        timestamp_ns,
+                        MetricValue::Double(value),
+                        mapped.labels.clone(),
+                    )
+                    .map_err(|e| anyhow::anyhow!("building data point: {e}"))?;
+                    points.push(point);
+                }
+                Ok(SeriesData {
+                    kind: options.metadata.kind_for(&series.metric_name),
+                    metric_name: series.metric_name,
+                    resource: mapped.resource,
+                    points,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !options.dry_run {
+            let block = write_metric_block(
+                &options.out_dir,
+                &BlockSpec {
+                    source_id: key.block_ulid.clone(),
+                    window_start_ns: state.start_ns,
+                    window_end_ns: state.end_ns,
+                    part: *part,
+                },
+                series,
+                &options.writer,
+            )?;
+            report.blocks.push(block);
+        }
     }
     *part = part.saturating_add(1);
     Ok(())
+}
+
+/// Stable series identity over the label set; independent of label mapping.
+fn fingerprint(labels: &Labels) -> u64 {
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    for (key, value) in labels {
+        hasher.update(key.as_bytes());
+        hasher.update(&[0xff]);
+        hasher.update(value.as_bytes());
+        hasher.update(&[0xfe]);
+    }
+    hasher.digest()
 }
