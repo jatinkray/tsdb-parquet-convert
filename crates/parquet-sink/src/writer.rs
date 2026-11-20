@@ -66,6 +66,18 @@ impl WriteOptions {
     }
 }
 
+/// Writer properties for callers that assemble their own batches
+/// (compaction, table maintenance).
+pub fn writer_properties(options: &WriteOptions) -> Result<WriterProperties, WriteError> {
+    options.validate()?;
+    Ok(WriterProperties::builder()
+        .set_compression(compression(options)?)
+        .set_max_row_group_row_count(Some(options.row_group_size))
+        .set_dictionary_enabled(true)
+        .set_statistics_enabled(EnabledStatistics::Page)
+        .build())
+}
+
 fn compression(options: &WriteOptions) -> Result<Compression, WriteError> {
     let level = options.compression_level;
     Ok(match options.compression.as_str() {

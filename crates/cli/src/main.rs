@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+mod compact;
 mod convert;
 mod ddl;
 mod destination;
@@ -64,6 +65,8 @@ enum Commands {
     Presets,
     /// Print query-engine DDL (or a view) for schema-mode output.
     EmitDdl(EmitDdlArgs),
+    /// Merge small schema-mode Parquet files into larger ones.
+    Compact(CompactArgs),
     /// Convert and install into a Parqtel data directory or replay over OTLP.
     Clone(CloneArgs),
     /// Reconcile source and converted blocks per series.
@@ -253,6 +256,26 @@ struct ConvertArgs {
 }
 
 #[derive(Debug, Args)]
+struct CompactArgs {
+    /// Directory holding the files to merge.
+    input: PathBuf,
+    /// Directory for the merged files.
+    #[arg(long)]
+    out: PathBuf,
+    #[arg(long, value_name = "FILE")]
+    schema: Option<PathBuf>,
+    #[arg(long, value_name = "NAME", conflicts_with = "schema")]
+    preset: Option<String>,
+    /// Rows per output file.
+    #[arg(long, default_value_t = 2_000_000)]
+    rows_per_file: usize,
+    #[arg(long, default_value = "zstd", value_parser = ["zstd", "snappy", "lz4", "none"])]
+    compression: String,
+    #[arg(long, default_value_t = 100_000)]
+    row_group_size: usize,
+}
+
+#[derive(Debug, Args)]
 struct EmitDdlArgs {
     /// Schema the files were written with.
     #[arg(long, value_name = "FILE")]
@@ -374,6 +397,7 @@ fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Commands::EmitDdl(args) => emit_ddl(args),
+        Commands::Compact(args) => run_compact(args),
         Commands::Clone(args) => clone(args, dry_run, cli.progress),
         Commands::Verify(args) => run_verify(args),
     }
@@ -519,6 +543,19 @@ fn run_convert(args: ConvertArgs, dry_run: bool, progress: bool) -> Result<i32> 
     } else {
         3
     })
+}
+
+fn run_compact(args: CompactArgs) -> Result<i32> {
+    let spec = resolve_schema(args.schema, args.preset)?
+        .context("compact needs --schema or --preset so the layout is known")?;
+    let options = parquet_sink::WriteOptions {
+        compression: args.compression,
+        compression_level: None,
+        row_group_size: args.row_group_size,
+    };
+    let report = compact::compact(&args.input, &args.out, &spec, &options, args.rows_per_file)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(0)
 }
 
 fn emit_ddl(args: EmitDdlArgs) -> Result<i32> {

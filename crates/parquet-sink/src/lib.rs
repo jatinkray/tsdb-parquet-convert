@@ -39,7 +39,9 @@ pub use spec::{
     ColumnSource, ColumnSpec, ColumnType, SchemaError, SchemaSpec, CURRENT_VERSION,
     DEFAULT_DECIMAL_PRECISION,
 };
-pub use writer::{block_filename, BlockWriter, FileInfo, SeriesInput, WriteOptions};
+pub use writer::{
+    block_filename, writer_properties, BlockWriter, FileInfo, SeriesInput, WriteOptions,
+};
 
 /// Everything that can fail while assembling or writing an output file.
 #[derive(Debug, thiserror::Error)]

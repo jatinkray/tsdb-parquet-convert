@@ -18,7 +18,7 @@ pub struct VerifyOptions {
     pub label_mapper: LabelMapper,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Digest {
     pub samples: u64,
     pub first_ts_ns: Option<i64>,
@@ -219,7 +219,7 @@ fn read_parquet_block(
 
 /// Layout the schema-mode verifier needs: the series identity, the sample
 /// timestamp and the sample value, wherever the user put them.
-struct SchemaLayout {
+pub(crate) struct SchemaLayout {
     fingerprint: String,
     timestamp: String,
     unit: TimeUnit,
@@ -227,7 +227,7 @@ struct SchemaLayout {
 }
 
 impl SchemaLayout {
-    fn resolve(spec: &SchemaSpec) -> Result<Self> {
+    pub(crate) fn resolve(spec: &SchemaSpec) -> Result<Self> {
         let mut fingerprint = None;
         let mut timestamp = None;
         let mut value_columns = Vec::new();
@@ -297,6 +297,60 @@ impl SchemaLayout {
             unit,
             value: value.name.clone(),
         })
+    }
+
+    /// Folds one batch into a per-fingerprint digest.
+    pub(crate) fn update_digest(
+        &self,
+        batch: &arrow_array::RecordBatch,
+        out: &mut BTreeMap<u64, Digest>,
+    ) -> Result<()> {
+        let fingerprints = self.fingerprints(batch)?;
+        let timestamps = self.timestamps_ns(batch)?;
+        let values = self.values(batch)?;
+        for (index, fingerprint) in fingerprints.iter().enumerate() {
+            let digest = out.entry(*fingerprint).or_default();
+            add_sample(digest, timestamps[index], values[index].to_bits());
+        }
+        Ok(())
+    }
+
+    fn fingerprints(&self, batch: &arrow_array::RecordBatch) -> Result<Vec<u64>> {
+        let column = batch
+            .column_by_name(&self.fingerprint)
+            .with_context(|| format!("missing column `{}`", self.fingerprint))?;
+        if let Some(values) = column.as_any().downcast_ref::<arrow_array::UInt64Array>() {
+            return Ok((0..values.len()).map(|index| values.value(index)).collect());
+        }
+        let values = column
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .context("series_fingerprint column is neither UInt64 nor Int64")?;
+        (0..values.len())
+            .map(|index| {
+                u64::try_from(values.value(index))
+                    .with_context(|| format!("row {index} has a negative series_fingerprint"))
+            })
+            .collect()
+    }
+
+    fn timestamps_ns(&self, batch: &arrow_array::RecordBatch) -> Result<Vec<i64>> {
+        let column = batch
+            .column_by_name(&self.timestamp)
+            .with_context(|| format!("missing column `{}`", self.timestamp))?;
+        (0..batch.num_rows())
+            .map(|index| timestamp_to_ns(column.as_ref(), index, self.unit))
+            .collect()
+    }
+
+    fn values(&self, batch: &arrow_array::RecordBatch) -> Result<Vec<f64>> {
+        let column = batch
+            .column_by_name(&self.value)
+            .with_context(|| format!("missing column `{}`", self.value))?
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .with_context(|| format!("column `{}` is not Float64", self.value))?;
+        Ok((0..column.len()).map(|index| column.value(index)).collect())
     }
 }
 
@@ -685,7 +739,7 @@ fn series_key(metric: &str, labels_json: &str) -> String {
     format!("{metric}{labels_json}")
 }
 
-fn add_sample(digest: &mut Digest, timestamp_ns: i64, value_bits: u64) {
+pub(crate) fn add_sample(digest: &mut Digest, timestamp_ns: i64, value_bits: u64) {
     use std::hash::Hasher;
     let mut hasher = xxhash_rust::xxh3::Xxh3::new();
     hasher.write_u64(digest.hash);
