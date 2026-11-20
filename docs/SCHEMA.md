@@ -113,7 +113,7 @@ No nested, list, map or struct types: one column is one value per sample row.
 
 | Source | Value |
 |---|---|
-| `timestamp` | The sample timestamp; required on every timestamp column |
+| `timestamp` | The sample timestamp; required on every `timestamp_*` and `date32` column |
 | `metric_name` | `__name__` of the series |
 | `value` | The sample value (`f64` in Prometheus TSDB) |
 | `series_fingerprint` | xxHash3 of the raw label set, stable across runs |
