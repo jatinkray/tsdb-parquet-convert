@@ -1803,7 +1803,7 @@ dependencies = [
 
 [[package]]
 name = "otlp-sink"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1873,7 +1873,7 @@ dependencies = [
 
 [[package]]
 name = "parqtel-sink"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "parqtel-core",
@@ -1921,7 +1921,7 @@ dependencies = [
 
 [[package]]
 name = "parquet-sink"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3079,6 +3079,16 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "tsdb-reader"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d679f86eff1d162d2c4c54e0a5f371090414e0077c691c217510343b7d77d5d0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "tsdb-reader"
+version = "0.2.0"
 dependencies = [
  "crc32c",
  "criterion",
@@ -3093,23 +3103,13 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
- "tsdb-reader 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tsdb-reader 0.1.0",
  "walkdir",
 ]
 
 [[package]]
-name = "tsdb-reader"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d679f86eff1d162d2c4c54e0a5f371090414e0077c691c217510343b7d77d5d0"
-dependencies = [
- "serde",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "tsdb2parqtel"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -3131,7 +3131,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "tsdb-reader 0.1.0",
+ "tsdb-reader 0.2.0",
  "walkdir",
  "xxhash-rust",
 ]
