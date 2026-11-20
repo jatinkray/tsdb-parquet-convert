@@ -146,6 +146,53 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  trust:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: sigstore/cosign-installer@v3
+      - name: SBOMs
+        run: |
+          set -euo pipefail
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin >/dev/null
+          for archive in dist/*.tar.gz dist/*.zip; do
+            [ -e "${archive}" ] || continue
+            syft "${archive}" -o spdx-json > "${archive}.spdx.json"
+          done
+          ls -1 dist/*.spdx.json
+      - name: Sign every asset (keyless, OIDC)
+        run: |
+          set -euo pipefail
+          for asset in dist/*.tar.gz dist/*.zip dist/*.spdx.json SHA256SUMS; do
+            [ -e "${asset}" ] || continue
+            cosign sign-blob --yes --bundle "${asset}.sigstore.json" "${asset}"
+          done
+          ls -1 dist/*.sigstore.json | wc -l
+      - uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN }}-${{ needs.prepare.outputs.version }}-trust
+          path: |
+            dist/*.spdx.json
+            dist/*.sigstore.json
+          if-no-files-found: error
+          retention-days: 14
+
   container:
     needs: [prepare, build]
     if: needs.prepare.outputs.should_release == 'true'
@@ -208,13 +255,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          path: dist
-          merge-multiple: true
+          path: artifacts
+      - name: Collect archives, SBOMs and signatures
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.spdx.json' -o -name '*.sigstore.json' \) -exec cp {} dist/ \;
+          ls -1 dist | sort
       - name: Checksums
         working-directory: dist
         run: |
           set -euo pipefail
-          sha256sum * > SHA256SUMS
+          sha256sum *.tar.gz *.zip *.spdx.json *.sigstore.json > SHA256SUMS
           cat SHA256SUMS
       - name: Publish the release
         env:

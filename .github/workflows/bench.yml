@@ -1,0 +1,40 @@
+name: Bench
+
+# Tracks the two numbers the cost story rests on: samples per second and bytes
+# per sample. A regression beyond the thresholds in scripts/bench.py fails the
+# job instead of landing silently.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/bench.py"
+      - "bench/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p tsdb2parqtel
+      - name: Measure
+        run: |
+          python3 scripts/bench.py \
+            target/release/tsdb2parqtel \
+            crates/tsdb-reader/tests/fixtures/testblock \
+            bench/baseline.json | tee bench-result.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-result
+          path: bench-result.json
+          if-no-files-found: warn

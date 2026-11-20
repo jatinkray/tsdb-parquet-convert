@@ -1,0 +1,8 @@
+{
+  "rows": 5550882,
+  "bytes": 4380863,
+  "seconds": 3.417,
+  "samples_per_second": 1624303,
+  "bytes_per_sample": 0.789,
+  "tool": "tsdb2parqtel 0.2.0"
+}
