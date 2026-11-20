@@ -42,9 +42,12 @@ error rather than ignored: `--sidecar`, `--label-mode otel`, `--label-mapping`,
 
 ## Example
 
-The repository ships a validated example, `examples/schema-labelled.yaml` (a
-test in `crates/parquet-sink/tests/roundtrip.rs` keeps it loadable). A smaller
-one:
+Presets are compiled into the binary (`tsdb2parqtel presets` lists them):
+`lean` (timestamp, value, series fingerprint), `series` (adds the metric name)
+and `otel` (adds nullable service/k8s columns). They live in
+`crates/cli/presets/`. The repository also ships a validated example,
+`examples/schema-labelled.yaml` (a test in
+`crates/parquet-sink/tests/roundtrip.rs` keeps it loadable). A smaller one:
 
 ```yaml
 version: 1

@@ -112,6 +112,120 @@ Constraints, all reported as errors instead of being ignored:
 - Schema mode reads the raw series labels, so what you map with `label:<key>` is
   exactly what the TSDB index stores.
 
+## Verify schema-mode output
+
+```bash
+tsdb2parqtel verify /var/lib/prometheus/blocks ./lake --preset series
+```
+
+Verification reads the Parquet back and rebuilds a per-series digest (sample
+count, first/last timestamp, ordered xxhash of `(timestamp_ns, value_bits)`),
+then compares it with the source. It needs two columns in the schema:
+
+- `source: series_fingerprint` typed `uint64`, which is how series are matched
+  without carrying labels;
+- one `source: value` column typed `float64`, because a cast copy cannot be
+  compared bit-for-bit.
+
+Exit code 4 means a missing, extra or mismatched series; the JSON report lists
+each one with both digests. Rolled-up output cannot be verified this way — the
+verifier compares every source sample.
+
+## Export to a data lake
+
+```bash
+tsdb2parqtel migrate s3://thanos/prod --out s3://lake/metrics \
+  --preset series --rollup 5m --state /var/lib/migrate/prod.json --verify
+```
+
+`migrate` runs convert, optional rollup and compaction, writes the manifest, and
+prints a JSON summary with rows scanned and written, file count, bytes, and the
+monthly storage cost at S3 Standard and Glacier Instant Retrieval list prices.
+`--verify` gates the run on the per-series reconciliation above.
+
+Object-store output assembles each file locally and uploads it, so peak local
+disk is one output file, not one run. Every schema-mode run writes
+`manifest.json` and `manifests/<run-id>.json` next to the data:
+
+```json
+{
+  "tool": "tsdb2parqtel 1.0.0",
+  "run_id": "20261120T201001Z-b239fe101527d074",
+  "source": "s3://thanos/prod",
+  "destination": "s3://lake/metrics",
+  "schema": {"name": "tsdb_series", "hash": "b239fe101527d074", "columns": 4},
+  "rollup": {"seconds": 300, "function": "avg"},
+  "totals": {"windows": 6, "files": 6, "rows": 560727, "bytes": 984886},
+  "windows": [],
+  "files": []
+}
+```
+
+## Roll up old data
+
+```bash
+tsdb2parqtel convert s3://thanos/prod --out s3://lake/metrics-5m \
+  --preset series --rollup 5m --rollup-func avg
+```
+
+One row per series and bucket, at the bucket start. Functions: `avg` (mean of
+the samples in the bucket), `sum`, `min`, `max`, `last` (sample with the latest
+timestamp), `count` (number of samples). Buckets are aligned with floor
+division, so `5m` buckets start at multiples of 300 s. The manifest records the
+width and function; a raw export is still the source of truth for verification.
+
+Measured on the repository fixture (5,550,882 samples): a 5m `avg` rollup wrote
+560,727 rows and 0.98 MB against 4.38 MB raw — 9.9x fewer rows, 4.45x fewer
+bytes.
+
+## Merge small files
+
+```bash
+tsdb2parqtel compact ./lake --out ./lake/compacted --preset series \
+  --rows-per-file 2000000
+```
+
+Compaction merges files without reordering rows and refuses to publish a result
+whose per-series digest differs from the input, so a silent row loss or
+reordering aborts the run. It does not cluster by label: pruning relies on the
+row-group statistics each file already carries.
+
+## Run on a schedule
+
+```bash
+# every 15 minutes, only new blocks are read
+tsdb2parqtel convert s3://thanos/prod --out s3://lake/metrics \
+  --preset series --state /var/lib/migrate/prod.json
+```
+
+The state file records each converted block ULID with its max timestamp and the
+schema hash that produced it. A block already recorded is skipped before any
+chunk is decoded; a state file written with a different schema hash is refused
+instead of mixing layouts.
+
+## Query what you wrote
+
+```bash
+tsdb2parqtel emit-ddl --preset series --target duckdb --table metrics \
+  --location ./lake > lake.sql
+duckdb < lake.sql
+```
+
+```sql
+-- inside duckdb after the view exists
+SELECT metric, avg(value) AS avg_value
+FROM metrics
+WHERE timestamp >= now() - INTERVAL 1 HOUR
+GROUP BY metric
+ORDER BY avg_value DESC
+LIMIT 10;
+```
+
+`--target athena` needs an `s3://` location and prints `CREATE EXTERNAL TABLE …
+STORED AS PARQUET`; `--target bigquery` needs a `gs://` location and prints an
+external table with `format = 'PARQUET'`. Nanosecond timestamps stay `INT64`
+where the engine cannot represent them.
+
 ## Migrate a Thanos bucket range
 
 ```bash

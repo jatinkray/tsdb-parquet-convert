@@ -1,47 +1,56 @@
 # tsdb2parqtel
 
-Convert persisted Prometheus / Thanos TSDB blocks into Parqtel-compatible
-Parquet blocks or Parquet for a schema of your own, and replay the same series
-into a running Parqtel over OTLP. This page is the overview; runbooks, the schema
-reference, the design record, the loss list and the verification report are
-linked from it and are not repeated here.
+Own your metric history. `tsdb2parqtel` turns Prometheus/Thanos TSDB blocks into
+Parquet you keep, on storage that costs cents per gigabyte-month, and can still
+convert to Parqtel blocks or replay into a running Parqtel over OTLP. This page
+is the overview; the runbooks, schema reference, design record, loss list and
+verification report are linked from it and are not repeated here.
 
 ```bash
-cargo build --release
-./target/release/tsdb2parqtel inspect /var/lib/prometheus/blocks
-./target/release/tsdb2parqtel convert /var/lib/prometheus/blocks \
-  --out ./parqtel-blocks --sidecar
-./target/release/tsdb2parqtel verify /var/lib/prometheus/blocks ./parqtel-blocks
+# One command: export a bucket to a data lake with a cost estimate and a
+# per-series verification gate.
+tsdb2parqtel migrate s3://thanos/prod --out s3://lake/metrics \
+  --preset series --rollup 5m --state /var/lib/migrate/prod.json --verify
+
+# Or stay explicit.
+tsdb2parqtel inspect /var/lib/prometheus/blocks
+tsdb2parqtel convert /var/lib/prometheus/blocks --out ./lake --preset series
+tsdb2parqtel verify /var/lib/prometheus/blocks ./lake --preset series
+./target/release/tsdb2parqtel --help
 ```
 
 ## What it does
 
 - Reads real Prometheus index v1/v2, chunk segments, XOR/XOR2/histogram chunk
-  encodings and tombstones natively.
-- Reads local Prometheus/Thanos blocks and staged `s3://`, `gs://`, `az://`
-  sources through the standard provider credential chains.
+  encodings and tombstones natively, plus local Prometheus/Thanos blocks and
+  staged `s3://`, `gs://`, `az://` sources through the standard provider
+  credential chains.
 - Filters by time, block ULID, PromQL-style label matcher and Thanos external
   labels; supports replica dedup and downsample selection.
-- Writes blocks through the pinned `parqtel-core` writer, so the Arrow schema,
-  footer series table and Parquet writer properties match the server exactly.
-- Scans one output window at a time and flushes at
-  `--max-rows-per-block`, so peak memory is independent of total source size.
-- Uses deterministic UUIDv5 filenames, so a re-run overwrites the same block
-  names instead of duplicating samples.
-- Produces `index.fragment.json`, installs into a stopped data directory with
-  a WAL guard, and replays over OTLP/HTTP with checkpoint/resume.
-- Verifies per series: labels, sample count, first/last timestamp and an ordered
-  xxhash of `(timestamp_ns, value_bits)`.
-- Writes ordinary Parquet for a schema you supply (`convert --schema`), with one
-  column per timestamp, metric name, sample value, label or constant; the
-  format is documented in [docs/SCHEMA.md](docs/SCHEMA.md).
+- Writes **ordinary Parquet for a schema you supply** (`--schema` or a built-in
+  preset): one column per timestamp, metric name, sample value, label or
+  constant, with dictionary encoding and page statistics.
+- Writes straight to an object store (`--out s3://…`), leaving a
+  `manifest.json` per run with the schema hash, file list, rows and bytes.
+- Rolls samples up (`--rollup 5m --rollup-func avg`) and merges small files
+  (`compact`), which is where a lakehouse query cost is actually won.
+- Keeps incremental runs cheap: `--state` records which blocks are already in
+  the destination and skips them before any chunk is decoded.
+- Emits the query-engine DDL for what it wrote (`emit-ddl --target
+  duckdb|athena|bigquery`).
+- Verifies per series — labels, sample count, first/last timestamp and an
+  ordered xxhash of `(timestamp_ns, value_bits)` — for Parqtel blocks and, with
+  `--schema`/`--preset`, for schema-mode Parquet.
+- Still writes Parqtel blocks and replays over OTLP/HTTP with checkpoint/resume
+  when Parqtel is the target.
 
 ## Two output modes
 
-Without `--schema`, output is Parqtel metric blocks: the pinned writer, the
-footer series index and the sidecar fragment. With `--schema <file>`, output is
-ordinary Parquet that follows that file, and every Parqtel-only flag is rejected
-rather than ignored. `clone` and `verify` operate on Parqtel only.
+Without `--schema`/`--preset`, output is Parqtel metric blocks: the pinned
+writer, the footer series index and the sidecar fragment. With a schema, output
+is ordinary Parquet that follows that file, and every Parqtel-only flag is
+rejected rather than ignored. `clone` operates on Parqtel only; `verify` covers
+both.
 
 ## Commands
 
@@ -49,14 +58,35 @@ rather than ignored. `clone` and `verify` operate on Parqtel only.
 |---|---|
 | `inspect <source>` | Blocks, ranges, series/chunk/sample counts, top label values |
 | `plan <source>` | Windows, row estimates, mapping preview, retention conflict |
-| `convert <source> --out <dir>` | Write Parquet blocks and optional sidecar fragment |
-| `convert <source> --out <dir> --schema <file>` | Write Parquet for that schema |
-| `schema <source> [--out <file>]` | Starter schema: one nullable column per label |
-| `clone <source> --target <dir\|url>` | Install into a data dir or OTLP replay |
-| `verify <source> <dir\|url>` | Per-series reconciliation; exit 4 on mismatch |
+| `convert <source> --out <dir\|url>` | Parquet for `--schema`/`--preset`, or Parqtel blocks |
+| `migrate <source> --out <dir\|url> --preset …` | Convert + rollup/compaction + manifest + cost estimate + optional `--verify` |
+| `compact <dir> --out <dir> --preset …` | Merge small files, proving rows are unchanged |
+| `schema <source>` | Starter schema: one nullable column per label |
+| `presets` | List the built-in schemas |
+| `emit-ddl --preset … --target duckdb\|athena\|bigquery` | View or external table for what you wrote |
+| `clone <source> --target <dir\|url>` | Install into a Parqtel data dir or OTLP replay |
+| `verify <source> <dir\|url> [--schema\|--preset]` | Per-series reconciliation; exit 4 on mismatch |
 
 Global: `--threads`, `--memory-limit`, `--log-format text|json`, `--progress`,
-`--dry-run`. See [docs/USAGE.md](docs/USAGE.md) for runbooks.
+`--dry-run`. See [docs/USAGE.md](docs/USAGE.md) for runbooks and
+[docs/SCHEMA.md](docs/SCHEMA.md) for the schema file.
+
+## Install
+
+```bash
+# Prebuilt static binaries (Linux musl x86_64/aarch64, macOS, Windows)
+gh release download --pattern '*x86_64-unknown-linux-musl.tar.gz'
+tar -xzf tsdb2parqtel-*-x86_64-unknown-linux-musl.tar.gz && ./tsdb2parqtel --version
+
+# Container
+docker run --rm ghcr.io/jatinkray/tsdb-parquet-convert:latest --version
+
+# From source
+cargo install --git https://github.com/jatinkray/tsdb-parquet-convert tsdb2parqtel
+```
+
+Every release carries `SHA256SUMS`, an SPDX SBOM per archive, cosign keyless
+signatures and a build-provenance attestation.
 
 ## Compatibility evidence
 
@@ -66,21 +96,19 @@ Global: `--threads`, `--memory-limit`, `--log-format text|json`, `--progress`,
   the explicit unrepresentable-series error.
 - `crates/parqtel-sink/tests/write_block.rs` asserts the Parquet schema, footer
   series index, row group and file naming.
-- `verify` was run against a real generated block and against a live Parqtel
-  instance (`source_series=1 output_series=1 source_samples=66 output_samples=66
-  mismatched=0`).
-- An OTLP clone into a fresh Parqtel was queried back through
-  `/api/v1/query_range` with identical timestamps and values.
 - `crates/parquet-sink/tests/roundtrip.rs` writes schema-driven files and reads
   them back: declared types, nullability, label values and cast errors.
+- `verify --preset lean` on the full fixture reconciles 35,354 series and
+  5,550,882 samples with 0 missing, 0 extra and 0 mismatched.
+- `bench/baseline.json` pins 1.62M samples/s and 0.789 B/sample; the `Bench`
+  workflow fails on a throughput or size regression beyond its thresholds.
 
 The exact audited Parqtel source and the docs/code discrepancies are recorded in
 [docs/DESIGN.md](docs/DESIGN.md). The schema-file format and conversion rules are
 in [docs/SCHEMA.md](docs/SCHEMA.md). Known losses are in
 [docs/LIMITATIONS.md](docs/LIMITATIONS.md); native histograms are decoded but
 not converted because Parqtel has no schema-preserving native-histogram column.
-Commands, results and the measured 5.55M-sample run are in
-[docs/REPORT.md](docs/REPORT.md).
+Commands, results and the measured runs are in [docs/REPORT.md](docs/REPORT.md).
 
 ## Development
 
@@ -89,6 +117,8 @@ make fmt
 make test
 make lint
 make docs-check
+python3 scripts/bench.py target/release/tsdb2parqtel \
+  crates/tsdb-reader/tests/fixtures/testblock bench/baseline.json
 ```
 
 The workspace pins `parqtel-core` by git revision and Arrow/Parquet 60.1.0.

@@ -53,6 +53,17 @@ executed. The report does not restate the design or the loss list.
 | release gate | `gh workflow run Release -f force=false` and two pushes on the released version | `prepare` succeeds, `build` and `release` skipped |
 | release v0.2.0 | version bump pushed to `main` (run 44794699212) | 5 archives + `SHA256SUMS` for 0.2.0, no manual step after the push |
 | released binary | `gh release download v0.2.0`, `sha256sum -c`, `--version`, then `convert --schema examples/schema-labelled.yaml` | checksum OK, reports `0.2.0`, writes 153 rows through the published binary |
+| schema verification | `verify <fixture> <dir> --preset lean` | 35,354 series / 5,550,882 samples, 0 missing, 0 extra, 0 mismatched; one tampered value gives exit 4 |
+| presets | `convert --preset lean\|series\|otel` then `verify --preset …` | lean: 153/153 samples on the matched metric; all three load and validate |
+| object-store output | in-memory store test + `convert --out` guards | staged bytes arrive intact, nested manifest paths work, Parqtel blocks and `--sidecar` refused for object stores |
+| run manifest | `convert --preset lean` | `manifest.json` equals `manifests/<run-id>.json`; schema hash, files, rows and bytes present |
+| incremental state | `--state` twice, then a different preset | second run `skipped_blocks=1`, nothing written; schema mismatch and missing `--schema` both refused |
+| rollups | `convert --rollup 5m` on the fixture | 5,550,882 rows / 4.38 MB became 560,727 rows / 0.98 MB (9.9x rows, 4.45x bytes); DuckDB reads 16 buckets for the 5m case |
+| compaction | `compact` 28 files with `--rows-per-file 2000000` | 3 files, identical per-series digest, rows and series unchanged, `verify` still 0 mismatched |
+| DDL | `emit-ddl --target duckdb` then executed in DuckDB | view returns the 153 rows, 1 series and the expected average |
+| migrate | `migrate <fixture> --preset series --compact --verify` | rows 5,550,882, files 6, verify 0 mismatched, JSON cost summary |
+| benchmark gate | `scripts/bench.py` against `bench/baseline.json` | passes at baseline; an unattainable baseline exits 1 with the ratio |
+| container | `docker build -f Dockerfile` then `docker run … presets` | image builds after presets moved into the crate and lists the presets |
 
 The files-mode block was opened by a real Parqtel debug server with
 `PARQTEL__STORAGE__DATA_DIR` pointed at the output directory; `/ready` returned

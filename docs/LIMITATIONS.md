@@ -109,6 +109,21 @@ that.
 - **Compression list is narrower than the writer.** The writer understands
   `gzip`, but the CLI exposes `zstd`, `snappy`, `lz4` and `none` only.
 
+## Lakehouse output
+
+- **Compaction does not cluster.** `compact` merges files and preserves row
+  order; it does not sort by label, so pruning relies on the row-group
+  statistics the writer already records.
+- **Rollups cannot be verified sample-for-sample.** `verify` compares every
+  source sample; `migrate --verify` refuses to run together with `--rollup`.
+  Keep a raw export if you need the exact check.
+- **Object-store output stages locally.** Each file is assembled in a temporary
+  directory and uploaded, so peak local disk is one output file, not one run.
+- **`--compact` needs local output.** It reads the written files back, so run it
+  after downloading an object-store export.
+- **Manifests are per run, not a catalog.** `manifest.json` describes one run;
+  there is no incremental table format (Iceberg/Delta) yet.
+
 ## Out of scope
 
 - Logs/traces conversion.
