@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod convert;
+mod ddl;
 mod destination;
 mod labels;
 mod metadata;
@@ -61,6 +62,8 @@ enum Commands {
     Schema(SchemaArgs),
     /// List the built-in schemas accepted by `--preset`.
     Presets,
+    /// Print query-engine DDL (or a view) for schema-mode output.
+    EmitDdl(EmitDdlArgs),
     /// Convert and install into a Parqtel data directory or replay over OTLP.
     Clone(CloneArgs),
     /// Reconcile source and converted blocks per series.
@@ -243,6 +246,29 @@ struct ConvertArgs {
 }
 
 #[derive(Debug, Args)]
+struct EmitDdlArgs {
+    /// Schema the files were written with.
+    #[arg(long, value_name = "FILE")]
+    schema: Option<PathBuf>,
+    /// Built-in schema the files were written with.
+    #[arg(long, value_name = "NAME", conflicts_with = "schema")]
+    preset: Option<String>,
+    /// Target engine.
+    #[arg(long, value_parser = ["duckdb", "athena", "bigquery"])]
+    target: String,
+    /// Table or view name.
+    #[arg(long, default_value = "metrics")]
+    table: String,
+    /// Data location: a local directory for DuckDB, `s3://…` for Athena,
+    /// `gs://…` for BigQuery.
+    #[arg(long, default_value = "")]
+    location: String,
+    /// Write to this file instead of stdout.
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 struct SchemaArgs {
     #[command(flatten)]
     source: SourceArgs,
@@ -340,6 +366,7 @@ fn run(cli: Cli) -> Result<i32> {
             println!("{}", presets::listing());
             Ok(0)
         }
+        Commands::EmitDdl(args) => emit_ddl(args),
         Commands::Clone(args) => clone(args, dry_run, cli.progress),
         Commands::Verify(args) => run_verify(args),
     }
@@ -481,6 +508,21 @@ fn run_convert(args: ConvertArgs, dry_run: bool, progress: bool) -> Result<i32> 
     } else {
         3
     })
+}
+
+fn emit_ddl(args: EmitDdlArgs) -> Result<i32> {
+    let spec =
+        resolve_schema(args.schema, args.preset)?.context("emit-ddl needs --schema or --preset")?;
+    let target = ddl::Target::parse(&args.target)?;
+    let text = ddl::render(&spec, target, &args.table, &args.location)?;
+    match args.out {
+        Some(path) => {
+            std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+            println!("wrote {}", path.display());
+        }
+        None => print!("{text}"),
+    }
+    Ok(0)
 }
 
 fn generate_schema(args: SchemaArgs) -> Result<i32> {
