@@ -1,7 +1,10 @@
 # tsdb2parqtel
 
 Convert persisted Prometheus / Thanos TSDB blocks into Parqtel-compatible
-Parquet blocks, or replay the same series into a running Parqtel over OTLP.
+Parquet blocks or Parquet for a schema of your own, and replay the same series
+into a running Parqtel over OTLP. This page is the overview; runbooks, the schema
+reference, the design record, the loss list and the verification report are
+linked from it and are not repeated here.
 
 ```bash
 cargo build --release
@@ -29,6 +32,16 @@ cargo build --release
   a WAL guard, and replays over OTLP/HTTP with checkpoint/resume.
 - Verifies per series: labels, sample count, first/last timestamp and an ordered
   xxhash of `(timestamp_ns, value_bits)`.
+- Writes ordinary Parquet for a schema you supply (`convert --schema`), with one
+  column per timestamp, metric name, sample value, label or constant; the
+  format is documented in [docs/SCHEMA.md](docs/SCHEMA.md).
+
+## Two output modes
+
+Without `--schema`, output is Parqtel metric blocks: the pinned writer, the
+footer series index and the sidecar fragment. With `--schema <file>`, output is
+ordinary Parquet that follows that file, and every Parqtel-only flag is rejected
+rather than ignored. `clone` and `verify` operate on Parqtel only.
 
 ## Commands
 
@@ -37,6 +50,8 @@ cargo build --release
 | `inspect <source>` | Blocks, ranges, series/chunk/sample counts, top label values |
 | `plan <source>` | Windows, row estimates, mapping preview, retention conflict |
 | `convert <source> --out <dir>` | Write Parquet blocks and optional sidecar fragment |
+| `convert <source> --out <dir> --schema <file>` | Write Parquet for that schema |
+| `schema <source> [--out <file>]` | Starter schema: one nullable column per label |
 | `clone <source> --target <dir\|url>` | Install into a data dir or OTLP replay |
 | `verify <source> <dir\|url>` | Per-series reconciliation; exit 4 on mismatch |
 
@@ -56,9 +71,12 @@ Global: `--threads`, `--memory-limit`, `--log-format text|json`, `--progress`,
   mismatched=0`).
 - An OTLP clone into a fresh Parqtel was queried back through
   `/api/v1/query_range` with identical timestamps and values.
+- `crates/parquet-sink/tests/roundtrip.rs` writes schema-driven files and reads
+  them back: declared types, nullability, label values and cast errors.
 
 The exact audited Parqtel source and the docs/code discrepancies are recorded in
-[docs/DESIGN.md](docs/DESIGN.md). Known losses are in
+[docs/DESIGN.md](docs/DESIGN.md). The schema-file format and conversion rules are
+in [docs/SCHEMA.md](docs/SCHEMA.md). Known losses are in
 [docs/LIMITATIONS.md](docs/LIMITATIONS.md); native histograms are decoded but
 not converted because Parqtel has no schema-preserving native-histogram column.
 Commands, results and the measured 5.55M-sample run are in

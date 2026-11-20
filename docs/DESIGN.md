@@ -205,3 +205,78 @@ then drops the window state. Independent windows run on Rayon with
 the total source size. On the 100M-sample synthetic block, eight concurrent 1M
 row windows peaked at 1.09 GiB and ran at ≈15.3M samples/s; `--threads 1` used
 109 MiB.
+
+## 10. Schema-driven output
+
+`convert --schema <file>` writes ordinary Parquet for a caller-supplied schema
+through `crates/parquet-sink`, bypassing `parqtel-sink`. Without the flag the
+Parqtel path is unchanged: same windows, same block writer, same sidecar.
+
+### 10.1 Pipeline
+
+The window buffer holds raw series identity plus `(timestamp_ns, value)` samples
+(`crates/cli/src/convert.rs`); Parqtel data points are built at flush time, so
+both writers share one accumulator and the memory profile of §9 is unchanged.
+Series identity is an xxHash3 fingerprint over the raw label set and does not
+depend on `--label-mode`. Schema mode therefore reads labels exactly as the TSDB
+index stores them: `--sidecar`, `--label-mode otel`, `--label-mapping`,
+`--metadata-file` and `--target-retention-days` are rejected instead of being
+silently ignored.
+
+### 10.2 Schema model
+
+`crates/parquet-sink/src/spec.rs` defines the file: `version: 1`, optional
+`name` and `description`, and per column `name`, `type`, `source`, `nullable`,
+`precision`, `scale`, `timezone`, `description`. Loading validates the version,
+unique non-empty names, at least one `timestamp_*` column fed by
+`source: timestamp`, decimal precision/scale bounds and that `timezone` appears
+only on timestamp columns.
+
+| Source | Value |
+|---|---|
+| `timestamp` | Sample timestamp, required on every timestamp column |
+| `metric_name` | `__name__` of the series |
+| `value` | Sample value |
+| `series_fingerprint` | xxHash3 of the raw label set, stable across runs |
+| `series_index` | Series ordinal inside the file |
+| `block_ulid` | Source block ULID |
+| `label:<key>` | One label value |
+| `const:<value>` | Literal for every row |
+
+The accepted subset is deliberate: a column must be expressible from one TSDB
+series row, so nested, list, map and struct types are not part of the format.
+
+### 10.3 Casting and nulls
+
+`crates/parquet-sink/src/value.rs` converts each source value into the declared
+column type: floats round half-away-from-zero into integers and are
+range-checked, unsigned columns reject negatives, text is parsed as a number or
+boolean, `date32` is derived from the sample timestamp, `decimal128` is
+`value * 10^scale` bounded by the precision, and timestamps accept nanoseconds
+from the source plus RFC 3339 or Unix seconds from text. A missing label is NULL
+for a nullable column and an error otherwise; both error forms name the column
+and the series fingerprint.
+
+### 10.4 Files
+
+`crates/parquet-sink/src/writer.rs` names files
+`data_{start_ns}_{end_ns}_{part:05}.parquet`, writes them atomically
+(`.tmp_<name>`, fsync, rename, directory fsync), enables dictionary encoding and
+page statistics, and sizes row groups from `--row-group-size`. The schema JSON
+and its name/description/version are stored in the Parquet key-value metadata,
+and every Arrow field carries `tsdb2parqtel.source` so a reader can tell how the
+column was produced.
+
+### 10.5 Verification boundary
+
+`verify` reconciles Parqtel output; it has no schema-mode equivalent, because a
+generic Parquet file has no series index to reconcile against. Schema output is
+covered by the round-trip tests in `crates/parquet-sink/tests/roundtrip.rs` and
+was checked end to end on 2026-11-20: `crates/tsdb-reader/tests/fixtures/testblock`
+converted with a generated 9-column schema produced 6 files with 5,550,882 rows,
+read back with pyarrow 26.0.1 with the declared types, nullability and values.
+See [docs/SCHEMA.md](SCHEMA.md) for the file format and the exact conversion
+rules.
+
+Usage — [docs/USAGE.md](USAGE.md) · Schema — [docs/SCHEMA.md](SCHEMA.md) ·
+Limitations — [docs/LIMITATIONS.md](LIMITATIONS.md) · Report — [docs/REPORT.md](REPORT.md)

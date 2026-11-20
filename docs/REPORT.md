@@ -35,6 +35,11 @@
 | install + Parqtel restart | `clone --target /tmp/...`; query `/api/v1/query_range` | labels, timestamps and values matched |
 | OTLP clone | `clone --target http://127.0.0.1:18091` | 66 samples, 0 retries; queried back identically |
 | live verify | `verify ... http://127.0.0.1:18092` | 66/66 samples, 0 mismatches |
+| schema spec validation | `cargo test -p parquet-sink --lib` | pass: 8 tests (unknown type, duplicate column, missing timestamp, decimal bounds, version) |
+| schema round trip | `cargo test -p parquet-sink --test roundtrip` | pass: 5 tests (types, NULL labels, cast errors, embedded schema, empty file) |
+| schema end to end | `schema <fixture> --out /tmp/schema.yaml` then `convert <fixture> --out /tmp/schema-out --schema /tmp/schema.yaml` | 5,550,882 rows in 6 files |
+| schema read back | pyarrow 26.0.1 over the 6 files | 9 columns, declared nullability, labels/timestamps/values correct |
+| schema flag guards | `convert --schema ... --sidecar`, `--metadata-file`, `--label-mode otel` | exit 1 with the documented message |
 
 The files-mode block was opened by a real Parqtel debug server with
 `PARQTEL__STORAGE__DATA_DIR` pointed at the output directory; `/ready` returned
@@ -98,3 +103,6 @@ Peak RSS is bounded by concurrent windows rather than total source size: eight
    targeted checks, not billion-sample audits.
 7. **No `cargo-deny` binary in the local image**; CI runs the official action
    with `deny.toml`. `cargo audit` was run locally and found no vulnerabilities.
+
+Usage — [docs/USAGE.md](USAGE.md) · Schema — [docs/SCHEMA.md](SCHEMA.md) ·
+Design — [docs/DESIGN.md](DESIGN.md) · Limitations — [docs/LIMITATIONS.md](LIMITATIONS.md)

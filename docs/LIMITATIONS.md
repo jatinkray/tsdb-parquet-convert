@@ -1,8 +1,11 @@
-# Limitations
+# Limitations — `tsdb2parqtel`
+
+Status: implemented; schema-driven output verified 2026-11-20.
 
 This is the honest loss list. If a feature cannot be represented in Parqtel,
 the tool reports it with block/series context instead of silently changing
-semantics.
+semantics. It does not describe how the tool works; see `docs/DESIGN.md` for
+that.
 
 ## Source coverage
 
@@ -81,6 +84,31 @@ semantics.
 - **`verify` requires the footer series index.** It does not reconstruct labels
   from a legacy row-level `labels` Parquet file.
 
+## Schema-driven output
+
+- **`verify` does not cover it.** `verify` reconciles Parqtel blocks through the
+  footer series index; schema-driven Parquet files have no such index. Check
+  them with any Parquet reader instead.
+- **Raw labels only.** `--label-mode otel`, `--label-mapping`, `--metadata-file`,
+  `--target-retention-days` and `--sidecar` are rejected with `--schema`: they
+  describe Parqtel block semantics, and accepting them would change the labels
+  and columns the schema file names.
+- **Flat columns only.** No nested, list, map, struct or extension types; a
+  column is one value per sample row.
+- **One timestamp column minimum.** The schema must declare a `timestamp_ms`,
+  `timestamp_us` or `timestamp_ns` column fed by `source: timestamp`; that
+  column is what places a row in time.
+- **Classic histograms stay flat.** `_bucket`, `_sum`, `_count` remain separate
+  series with `le` in schema mode as well; there is no complex-value column.
+- **`decimal128` goes through `f64`.** Values beyond 53 bits of integer
+  precision are not exact; use `float64` or a scaled integer column for wide
+  counters.
+- **`+Inf`, `-Inf` and `NaN` pass into float columns.** Text columns and
+  `decimal128` reject non-finite input, and `utf8` formatting of a non-finite
+  value is an error.
+- **Compression list is narrower than the writer.** The writer understands
+  `gzip`, but the CLI exposes `zstd`, `snappy`, `lz4` and `none` only.
+
 ## Out of scope
 
 - Logs/traces conversion.
@@ -111,3 +139,6 @@ semantics.
 - **Bounded file reads, not mmap.** Chunk records are read with checked
   `Read`/`Seek` calls. The process therefore never has to keep a whole segment
   mapped, at the cost of one read syscall per chunk.
+
+Usage — [docs/USAGE.md](USAGE.md) · Schema — [docs/SCHEMA.md](SCHEMA.md) ·
+Design — [docs/DESIGN.md](DESIGN.md) · Report — [docs/REPORT.md](REPORT.md)

@@ -1,7 +1,8 @@
 # Usage — `tsdb2parqtel`
 
 `tsdb2parqtel` converts persisted Prometheus/Thanos TSDB blocks into Parqtel
-Parquet blocks, or replays them into a running Parqtel over OTLP/HTTP.
+Parquet blocks, writes ordinary Parquet for a schema you supply, or replays the
+same series into a running Parqtel over OTLP/HTTP.
 
 Build:
 
@@ -10,9 +11,14 @@ cargo build --release
 ./target/release/tsdb2parqtel --help
 ```
 
-Exit codes: `0` success, `1` generic error, `2` source not found/unreadable,
-`3` partial success with `--on-error=skip`, `4` verification mismatch, `5`
-retention refusal.
+| Exit code | Meaning |
+|---|---|
+| `0` | Success |
+| `1` | Generic error, including a rejected flag combination |
+| `2` | Source not found or unreadable |
+| `3` | Partial success with `--on-error=skip` |
+| `4` | Verification mismatch |
+| `5` | Retention refusal |
 
 ## Migrate a local Prometheus data directory
 
@@ -41,6 +47,42 @@ tsdb2parqtel clone /var/lib/prometheus/blocks \
 ```
 
 The tool refuses to mutate a target with WAL files unless `--force`.
+
+## Convert to Parquet for a custom schema
+
+Use this when the target is not Parqtel: you name the columns, their types and
+where each value comes from, and the tool writes plain Parquet. The format,
+types, sources, cast rules and failure messages are in
+[docs/SCHEMA.md](SCHEMA.md).
+
+Generate a starting schema from the block index (no chunk data is decoded):
+
+```bash
+tsdb2parqtel schema /var/lib/prometheus/blocks --out schema.yaml
+```
+
+Edit it (`--max-labels N`, `--no-labels` and `--name` control the generated
+file), then convert:
+
+```bash
+tsdb2parqtel convert /var/lib/prometheus/blocks \
+  --out ./parquet \
+  --schema schema.yaml \
+  --min-time 2026-01-01T00:00:00Z --max-time 2026-02-01T00:00:00Z
+```
+
+Files are named `data_{start_ns}_{end_ns}_{part:05}.parquet`, a window is split
+into files of at most `--max-rows-per-block` rows, and a rerun overwrites the
+same names. The schema is embedded in each file's Parquet metadata.
+
+Constraints, all reported as errors instead of being ignored:
+
+- `--sidecar`, `--label-mode otel`, `--label-mapping`, `--metadata-file` and
+  `--target-retention-days` are Parqtel-only; remove them with `--schema`.
+- `clone` and `verify` have no schema mode; `verify` reconciles Parqtel blocks
+  through their footer series index.
+- Schema mode reads the raw series labels, so what you map with `label:<key>` is
+  exactly what the TSDB index stores.
 
 ## Migrate a Thanos bucket range
 
@@ -172,3 +214,6 @@ The compose file is `deploy/e2e/docker-compose.yml`; it publishes the HTTP API
 on `127.0.0.1:18080` and OTLP gRPC on `14317`. Live reconciliation uses a
 two-minute source slice because Parqtel's instant-query path is intentionally
 one request per sample.
+
+Schema — [docs/SCHEMA.md](SCHEMA.md) · Design — [docs/DESIGN.md](DESIGN.md) ·
+Limitations — [docs/LIMITATIONS.md](LIMITATIONS.md) · Report — [docs/REPORT.md](REPORT.md)
