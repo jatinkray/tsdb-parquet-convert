@@ -111,6 +111,24 @@ Peak RSS is bounded by concurrent windows rather than total source size: eight
 (109 MiB on the same source). The previous one-pass implementation peaked at
 3.33 GiB.
 
+## Throughput and size baseline
+
+`bench/baseline.json`, regenerated with `scripts/bench.py --update` on a release
+build of the fixture; the `Bench` workflow fails a run whose throughput drops
+below 70% of this baseline or whose bytes per sample grow by more than 30%.
+
+| Measure | Value |
+|---|---|
+| Input | `crates/tsdb-reader/tests/fixtures/testblock`, 5,550,882 samples |
+| Preset | `series` (timestamp, metric, value, series fingerprint) |
+| Wall time | 3.42 s |
+| Throughput | 1,624,303 samples/s |
+| Output | 4,380,863 bytes in 6 files |
+| Bytes per sample | 0.789 |
+
+Rollup comparison on the same input: a 5m `avg` rollup wrote 560,727 rows and
+984,886 bytes — 9.9x fewer rows and 4.45x fewer bytes than the raw export.
+
 ## Open risks / backlog
 
 1. **Native histograms are decoded but not converted.** Parqtel has explicit
