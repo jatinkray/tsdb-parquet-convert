@@ -38,6 +38,7 @@ env:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
@@ -102,6 +103,9 @@ jobs:
             os: windows-latest
             musl: false
     runs-on: ${{ matrix.os }}
+    # Fat LTO on a cold Intel macOS runner is the slowest leg of the matrix;
+    # this bounds a hung runner instead of waiting for the 6h default.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -146,6 +150,7 @@ jobs:
     needs: [prepare, build]
     if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
     steps:

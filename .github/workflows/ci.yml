@@ -39,14 +39,14 @@ jobs:
 
   audit:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      checks: write
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+      # Run cargo-audit directly: the rustsec/audit-check action failed
+      # intermittently with "Not Found ... update-a-check-run" when it tried to
+      # update a check run it had created earlier in the same job.
+      - run: cargo audit
 
   musl:
     runs-on: ubuntu-latest
