@@ -23,6 +23,27 @@ docker run --rm ghcr.io/jatinkray/tsdb-parquet-convert:latest --version
 cargo install --git https://github.com/jatinkray/tsdb-parquet-convert tsdb2parqtel
 ```
 
+Verify what you downloaded before running it:
+
+```bash
+# Checksums cover every asset, including SBOMs and signature bundles
+sha256sum -c <(grep 'x86_64-unknown-linux-musl.tar.gz$' SHA256SUMS)
+
+# Keyless signature from the release workflow
+cosign verify-blob \
+  --bundle tsdb2parqtel-1.0.0-x86_64-unknown-linux-musl.tar.gz.sigstore.json \
+  --certificate-identity-regexp 'https://github.com/.*/release.yml@refs/heads/main' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  tsdb2parqtel-1.0.0-x86_64-unknown-linux-musl.tar.gz
+
+# Build provenance (gh >= 2.49)
+gh attestation verify tsdb2parqtel-1.0.0-x86_64-unknown-linux-musl.tar.gz \
+  --repo jatinkray/tsdb-parquet-convert
+```
+
+Each archive also ships as `<archive>.spdx.json` (SBOM) with its own signature
+bundle.
+
 Homebrew users render a formula from the release checksums (no tap is
 published):
 

@@ -64,6 +64,11 @@ executed. The report does not restate the design or the loss list.
 | migrate | `migrate <fixture> --preset series --compact --verify` | rows 5,550,882, files 6, verify 0 mismatched, JSON cost summary |
 | benchmark gate | `scripts/bench.py` against `bench/baseline.json` | passes at baseline; an unattainable baseline exits 1 with the ratio |
 | container | `docker build -f Dockerfile` then `docker run … presets` | image builds after presets moved into the crate and lists the presets |
+| release v1.0.0 | push of the version bump (run 44818360836) | all five builds, `trust`, `container` and `release` succeeded; 21 assets: 5 archives, 5 SBOMs, 10 signature bundles, `SHA256SUMS` |
+| signature | `cosign verify-blob --bundle … --certificate-identity …release.yml@refs/heads/main` | `Verified OK` |
+| provenance | `gh api repos/…/attestations/sha256:<digest>` | one attestation with an in-toto SLSA statement |
+| published container | `docker pull ghcr.io/…/tsdb-parquet-convert:1.0.0` then `--version`, `presets` | pulls anonymously, reports `1.0.0`, lists the presets |
+| published binary | `gh release download v1.0.0`, `sha256sum -c`, then `migrate … --rollup 5m --compact` | checksum OK; 560,727 rows, 6 files compacted to 2, exit 0 |
 
 The files-mode block was opened by a real Parqtel debug server with
 `PARQTEL__STORAGE__DATA_DIR` pointed at the output directory; `/ready` returned
