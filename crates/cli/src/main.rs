@@ -404,7 +404,11 @@ fn main() {
 fn init_tracing(cli: &Cli) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    // Logs go to stderr so stdout stays machine-readable: manifests, JSON
+    // reports and `emit-ddl` output can be piped straight into `jq`.
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
     if cli.log_format == "json" {
         builder.json().init();
     } else {
