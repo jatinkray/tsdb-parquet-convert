@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use tsdb_reader::{
     DownsamplePolicy, ExternalLabels, OnError, Source, SourceOptions, StaleMarkerPolicy,
 };
-use verify::{verify, verify_live, VerifyOptions};
+use verify::{verify, verify_live, verify_schema, VerifyOptions};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -267,6 +267,9 @@ struct VerifyArgs {
     target: String,
     #[command(flatten)]
     output: OutputArgs,
+    /// Verify schema-mode Parquet output against this schema file.
+    #[arg(long, value_name = "FILE")]
+    schema: Option<PathBuf>,
     #[arg(long)]
     json: bool,
     #[arg(long)]
@@ -683,7 +686,18 @@ fn run_verify(args: VerifyArgs) -> Result<i32> {
         source: args.source.to_options()?,
         label_mapper: args.output.mapper()?,
     };
-    let report = if args.target.starts_with("http://") || args.target.starts_with("https://") {
+    let live = args.target.starts_with("http://") || args.target.starts_with("https://");
+    let report = if let Some(schema_path) = args.schema.as_deref() {
+        if live {
+            anyhow::bail!(
+                "--schema verifies Parquet files; a live URL is reconciled by the Parqtel path"
+            );
+        }
+        let spec = parquet_sink::SchemaSpec::from_path(schema_path)
+            .map_err(|error| anyhow::anyhow!("{error}"))
+            .with_context(|| format!("loading schema {}", schema_path.display()))?;
+        verify_schema(&options, &spec, Path::new(&args.target))?
+    } else if live {
         verify_live(&options, &args.target)?
     } else {
         verify(&options, Path::new(&args.target))?

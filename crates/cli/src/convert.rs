@@ -397,7 +397,10 @@ fn flush_window(
 }
 
 /// Stable series identity over the label set; independent of label mapping.
-fn fingerprint(labels: &Labels) -> u64 {
+///
+/// `verify --schema` recomputes the same value so schema-mode output can be
+/// reconciled by `series_fingerprint` without carrying labels.
+pub(crate) fn fingerprint(labels: &Labels) -> u64 {
     let mut hasher = xxhash_rust::xxh3::Xxh3::new();
     for (key, value) in labels {
         hasher.update(key.as_bytes());

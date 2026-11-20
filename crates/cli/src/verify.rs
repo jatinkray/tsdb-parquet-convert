@@ -1,8 +1,12 @@
 //! Per-series reconciliation between a TSDB source and Parqtel blocks.
 
+use crate::convert::fingerprint;
 use crate::labels::LabelMapper;
 use anyhow::{Context, Result};
+use arrow::datatypes::TimeUnit;
+use arrow_array::Array;
 use parqtel_core::storage::SeriesTable;
+use parquet_sink::{ColumnSource, ColumnType, SchemaSpec};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -211,6 +215,284 @@ fn read_parquet_block(
         }
     }
     Ok(())
+}
+
+/// Layout the schema-mode verifier needs: the series identity, the sample
+/// timestamp and the sample value, wherever the user put them.
+struct SchemaLayout {
+    fingerprint: String,
+    timestamp: String,
+    unit: TimeUnit,
+    value: String,
+}
+
+impl SchemaLayout {
+    fn resolve(spec: &SchemaSpec) -> Result<Self> {
+        let mut fingerprint = None;
+        let mut timestamp = None;
+        let mut value_columns = Vec::new();
+        for column in &spec.columns {
+            let source = column
+                .parsed_source()
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            match source {
+                ColumnSource::SeriesFingerprint => fingerprint = Some(column),
+                // `date32` also reads the sample timestamp but only keeps the
+                // day, so it cannot stand in for the verification timestamp.
+                ColumnSource::Timestamp if column.column_type.is_timestamp() => {
+                    timestamp = Some(column)
+                }
+                ColumnSource::Value => value_columns.push(column),
+                _ => {}
+            }
+        }
+        let fingerprint = fingerprint.context(
+            "verify --schema needs a column with `source: series_fingerprint` to identify series; add it to the schema and re-convert",
+        )?;
+        match fingerprint.column_type {
+            ColumnType::UInt64 | ColumnType::Int64 => {}
+            other => anyhow::bail!(
+                "column `{}` has `source: series_fingerprint` but type `{other}`; use `uint64`",
+                fingerprint.name
+            ),
+        }
+        let timestamp = timestamp.context(
+            "verify --schema needs a `timestamp_ms`, `timestamp_us` or `timestamp_ns` column",
+        )?;
+        let unit = match timestamp.column_type {
+            ColumnType::TimestampMs => TimeUnit::Millisecond,
+            ColumnType::TimestampUs => TimeUnit::Microsecond,
+            ColumnType::TimestampNs => TimeUnit::Nanosecond,
+            other => anyhow::bail!(
+                "column `{}` is not a timestamp column (type `{other}`)",
+                timestamp.name
+            ),
+        };
+        if value_columns.is_empty() {
+            anyhow::bail!(
+                "verify --schema needs a column with `source: value` so sample values can be compared"
+            );
+        }
+        // A schema may write the sample value into several columns (a copy, a
+        // widened decimal); verification needs the bit-exact one.
+        let value = match value_columns
+            .iter()
+            .find(|column| column.column_type == ColumnType::Float64)
+        {
+            Some(column) => *column,
+            None => {
+                let seen: Vec<String> = value_columns
+                    .iter()
+                    .map(|column| format!("`{}` ({})", column.name, column.column_type))
+                    .collect();
+                anyhow::bail!(
+                    "no `float64` column carries `source: value` (found {}); verification compares values bit-for-bit",
+                    seen.join(", ")
+                );
+            }
+        };
+        Ok(Self {
+            fingerprint: fingerprint.name.clone(),
+            timestamp: timestamp.name.clone(),
+            unit,
+            value: value.name.clone(),
+        })
+    }
+}
+
+/// Reconciles schema-mode Parquet output with the source.
+///
+/// Series identity is the `series_fingerprint` column, recomputed from the
+/// source with the same hash the converter uses, so no labels need to be
+/// carried in the output.
+pub fn verify_schema(
+    options: &VerifyOptions,
+    spec: &SchemaSpec,
+    dir: &Path,
+) -> Result<VerifyReport> {
+    let layout = SchemaLayout::resolve(spec)?;
+    let source = Source::open(options.source.clone())?;
+    let mut source_digests: BTreeMap<String, Digest> = BTreeMap::new();
+    source.scan(|record| {
+        if record.metric_name().is_none() {
+            return Ok(());
+        }
+        let key = series_fingerprint_key(fingerprint(&record.labels));
+        let digest = source_digests.entry(key).or_default();
+        for sample in record.samples {
+            let timestamp_ns = sample.timestamp_ms.checked_mul(1_000_000).ok_or(
+                tsdb_reader::Error::TimestampOutOfRange {
+                    timestamp_ms: sample.timestamp_ms,
+                },
+            )?;
+            add_sample(digest, timestamp_ns, sample.value.to_bits());
+        }
+        Ok(())
+    })?;
+
+    let min_ns = options
+        .source
+        .min_time_ms
+        .and_then(|value| value.checked_mul(1_000_000))
+        .unwrap_or(i64::MIN);
+    let max_ns = options
+        .source
+        .max_time_ms
+        .and_then(|value| value.checked_mul(1_000_000))
+        .unwrap_or(i64::MAX);
+    let output_digests = read_schema_dir(dir, &layout, min_ns, max_ns)?;
+
+    let mut report = VerifyReport {
+        source_series: source_digests.len(),
+        output_series: output_digests.len(),
+        source_samples: source_digests.values().map(|digest| digest.samples).sum(),
+        output_samples: output_digests.values().map(|digest| digest.samples).sum(),
+        ..VerifyReport::default()
+    };
+    for (key, source_digest) in &source_digests {
+        match output_digests.get(key) {
+            None => report.missing.push(key.clone()),
+            Some(output_digest)
+                if output_digest.samples != source_digest.samples
+                    || output_digest.first_ts_ns != source_digest.first_ts_ns
+                    || output_digest.last_ts_ns != source_digest.last_ts_ns
+                    || output_digest.hash != source_digest.hash =>
+            {
+                report.mismatched.push(Mismatch {
+                    series: key.clone(),
+                    source: source_digest.clone(),
+                    output: output_digest.clone(),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    for key in output_digests.keys() {
+        if !source_digests.contains_key(key) {
+            report.extra.push(key.clone());
+        }
+    }
+    report.missing.sort();
+    report.extra.sort();
+    Ok(report)
+}
+
+fn series_fingerprint_key(fingerprint: u64) -> String {
+    format!("series_fingerprint={fingerprint}")
+}
+
+fn read_schema_dir(
+    dir: &Path,
+    layout: &SchemaLayout,
+    min_ns: i64,
+    max_ns: i64,
+) -> Result<BTreeMap<String, Digest>> {
+    let mut files = Vec::new();
+    for entry in walkdir::WalkDir::new(dir).max_depth(2).into_iter() {
+        let entry = entry?;
+        if entry.file_type().is_file()
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "parquet")
+        {
+            files.push(entry.path().to_path_buf());
+        }
+    }
+    if files.is_empty() {
+        anyhow::bail!("no Parquet files under {}", dir.display());
+    }
+    files.sort();
+    let mut out: BTreeMap<String, Digest> = BTreeMap::new();
+    for path in files {
+        read_schema_file(&path, layout, min_ns, max_ns, &mut out)
+            .with_context(|| format!("reading {}", path.display()))?;
+    }
+    Ok(out)
+}
+
+fn read_schema_file(
+    path: &Path,
+    layout: &SchemaLayout,
+    min_ns: i64,
+    max_ns: i64,
+    out: &mut BTreeMap<String, Digest>,
+) -> Result<()> {
+    let file = std::fs::File::open(path)?;
+    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?;
+    for batch in builder.build()? {
+        let batch = batch?;
+        let fingerprints: Vec<Option<u64>> = batch
+            .column_by_name(&layout.fingerprint)
+            .with_context(|| format!("missing column `{}`", layout.fingerprint))?
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .map(|array| {
+                (0..array.len())
+                    .map(|index| Some(array.value(index)))
+                    .collect()
+            })
+            .or_else(|| {
+                batch
+                    .column_by_name(&layout.fingerprint)?
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .map(|array| {
+                        (0..array.len())
+                            .map(|index| u64::try_from(array.value(index)).ok())
+                            .collect()
+                    })
+            })
+            .context("series_fingerprint column is neither UInt64 nor Int64")?;
+        let timestamps = batch
+            .column_by_name(&layout.timestamp)
+            .with_context(|| format!("missing column `{}`", layout.timestamp))?;
+        let values = batch
+            .column_by_name(&layout.value)
+            .with_context(|| format!("missing column `{}`", layout.value))?
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .with_context(|| format!("column `{}` is not Float64", layout.value))?;
+        for (index, fingerprint) in fingerprints.iter().enumerate() {
+            let Some(fingerprint) = *fingerprint else {
+                anyhow::bail!(
+                    "row {index} of {} has a negative series_fingerprint",
+                    path.display()
+                );
+            };
+            let timestamp_ns = timestamp_to_ns(timestamps, index, layout.unit)?;
+            if timestamp_ns >= min_ns && timestamp_ns < max_ns {
+                let digest = out.entry(series_fingerprint_key(fingerprint)).or_default();
+                add_sample(digest, timestamp_ns, values.value(index).to_bits());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn timestamp_to_ns(array: &dyn Array, index: usize, unit: TimeUnit) -> Result<i64> {
+    let nanos = match unit {
+        TimeUnit::Millisecond => array
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+            .context("timestamp column is not Timestamp(ms)")?
+            .value(index)
+            .checked_mul(1_000_000),
+        TimeUnit::Microsecond => array
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+            .context("timestamp column is not Timestamp(us)")?
+            .value(index)
+            .checked_mul(1_000),
+        TimeUnit::Nanosecond => array
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+            .context("timestamp column is not Timestamp(ns)")?
+            .value(index)
+            .into(),
+        other => anyhow::bail!("unsupported timestamp unit {other:?}"),
+    };
+    nanos.context("timestamp does not fit nanoseconds")
 }
 
 /// Verifies a live Parqtel instance by asking one instant query per source
@@ -457,5 +739,54 @@ mod tests {
         assert!(result_matches(&exact, "m", &labels));
         assert!(!result_matches(&wrong, "m", &labels));
         assert!(!result_matches(&superset, "m", &labels));
+    }
+
+    fn layout(yaml: &str) -> Result<SchemaLayout> {
+        let spec: SchemaSpec = yaml
+            .parse()
+            .map_err(|error: parquet_sink::SchemaError| anyhow::anyhow!("{error}"))?;
+        SchemaLayout::resolve(&spec)
+    }
+
+    #[test]
+    fn layout_uses_the_timestamp_column_not_the_date32_copy() -> Result<()> {
+        let resolved = layout(
+            "columns:\n  - name: day\n    type: date32\n    source: timestamp\n  - name: ts\n    type: timestamp_us\n    source: timestamp\n  - name: id\n    type: uint64\n    source: series_fingerprint\n  - name: v\n    type: float64\n    source: value\n",
+        )?;
+        assert_eq!(resolved.timestamp, "ts");
+        assert_eq!(resolved.unit, TimeUnit::Microsecond);
+        Ok(())
+    }
+
+    #[test]
+    fn layout_prefers_the_float64_value_column() -> Result<()> {
+        let resolved = layout(
+            "columns:\n  - name: ts\n    type: timestamp_ns\n    source: timestamp\n  - name: id\n    type: uint64\n    source: series_fingerprint\n  - name: scaled\n    type: decimal128\n    source: value\n    precision: 20\n    scale: 3\n  - name: v\n    type: float64\n    source: value\n",
+        )?;
+        assert_eq!(resolved.value, "v");
+        Ok(())
+    }
+
+    #[test]
+    fn layout_rejects_a_schema_without_series_identity() {
+        let error = layout(
+            "columns:\n  - name: ts\n    type: timestamp_ns\n    source: timestamp\n  - name: v\n    type: float64\n    source: value\n",
+        );
+        assert!(error
+            .err()
+            .map(|error| error.to_string().contains("series_fingerprint"))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn layout_rejects_a_non_exact_value_column() {
+        let error = layout(
+            "columns:\n  - name: ts\n    type: timestamp_ns\n    source: timestamp\n  - name: id\n    type: uint64\n    source: series_fingerprint\n  - name: v\n    type: float32\n    source: value\n",
+        );
+        let message = error
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(message.contains("no `float64` column"), "{message}");
     }
 }
