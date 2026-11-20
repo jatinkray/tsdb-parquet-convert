@@ -150,10 +150,11 @@ and `const:` literals are text, sample values are `f64`.
 
 Loading fails, naming the column, when: `version` is not `1`; there are no
 columns; a name is empty or duplicated; a type or source is unknown; no
-`timestamp_*` column uses `source: timestamp`; a timestamp column uses another
-source; `source: timestamp` appears on a non-timestamp column; `precision` or
-`scale` appears outside `decimal128`; a decimal precision is outside 1–38 or its
-scale outside 0–precision; `timezone` appears outside timestamp columns.
+`timestamp_*` column uses `source: timestamp`; a `timestamp_*` or `date32`
+column uses another source; `source: timestamp` appears on any other type;
+`precision` or `scale` appears outside `decimal128`; a decimal precision is
+outside 1–38 or its scale outside 0–precision; `timezone` appears outside
+timestamp columns.
 
 ## Output layout
 

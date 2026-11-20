@@ -51,6 +51,8 @@ executed. The report does not restate the design or the loss list.
 | release workflow | push to `main` on an unreleased version | run 44789349646 published `v0.1.0`: 5 archives + `SHA256SUMS` |
 | release artifact | `gh release download v0.1.0` then `sha256sum -c` | checksums OK; `x86_64-unknown-linux-musl` binary is static-pie and reports `0.1.0` |
 | release gate | `gh workflow run Release -f force=false` and two pushes on the released version | `prepare` succeeds, `build` and `release` skipped |
+| release v0.2.0 | version bump pushed to `main` (run 44794699212) | 5 archives + `SHA256SUMS` for 0.2.0, no manual step after the push |
+| released binary | `gh release download v0.2.0`, `sha256sum -c`, `--version`, then `convert --schema examples/schema-labelled.yaml` | checksum OK, reports `0.2.0`, writes 153 rows through the published binary |
 
 The files-mode block was opened by a real Parqtel debug server with
 `PARQTEL__STORAGE__DATA_DIR` pointed at the output directory; `/ready` returned
