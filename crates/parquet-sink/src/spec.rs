@@ -210,17 +210,22 @@ impl SchemaSpec {
                         .to_string(),
                 ));
             }
-            if column.column_type.is_timestamp() {
+            if column.column_type.is_timestamp() || matches!(column.column_type, ColumnType::Date32) {
                 if !matches!(source, ColumnSource::Timestamp) {
+                    let reason = if column.column_type.is_timestamp() {
+                        "a unit conversion the schema cannot express"
+                    } else {
+                        "day granularity is derived from the sample timestamp"
+                    };
                     return Err(column_error(
                         column,
                         format!(
-                            "`{}` columns must use `source: timestamp`; `{}` would need a unit conversion the schema cannot express",
+                            "`{}` columns must use `source: timestamp`; `{}` would need {reason}",
                             column.column_type, column.source
                         ),
                     ));
                 }
-                has_timestamp = true;
+                has_timestamp = has_timestamp || column.column_type.is_timestamp();
             } else if matches!(source, ColumnSource::Timestamp) {
                 return Err(column_error(
                     column,
@@ -556,6 +561,25 @@ mod tests {
         );
         assert!(error.is_err());
         Ok(())
+    }
+
+    #[test]
+    fn accepts_date32_from_the_sample_timestamp() -> Result<(), SchemaError> {
+        let parsed = spec(
+            "columns:\n  - name: ts\n    type: timestamp_ns\n    source: timestamp\n  - name: day\n    type: date32\n    source: timestamp\n",
+        )?;
+        assert_eq!(parsed.arrow_schema().field(1).data_type(), &DataType::Date32);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_date32_from_a_label() {
+        let error = spec(
+            "columns:\n  - name: day\n    type: date32\n    source: label:day\n  - name: ts\n    type: timestamp_ns\n    source: timestamp\n",
+        );
+        let message = error.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("must use `source: timestamp`"), "{message}");
+        assert!(message.contains("granularity"), "{message}");
     }
 
     #[test]

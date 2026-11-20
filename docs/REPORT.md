@@ -46,8 +46,11 @@ executed. The report does not restate the design or the loss list.
 | schema read back | pyarrow 26.0.1 over the 6 files | 9 columns, declared nullability, labels/timestamps/values correct |
 | schema flag guards | `convert --schema ... --sidecar`, `--metadata-file`, `--label-mode otel`, `--label-mapping`, `--target-retention-days` | exit 1 with the documented message |
 | example schema | `convert <fixture> --out /tmp --schema examples/schema-labelled.yaml` | 5,550,882 rows, 6 files, 0 errors |
+| type coverage | one schema using `timestamp_ns/us/ms`, `date32`, `float32/64`, `int32/64`, `uint64`, `boolean`, `utf8`, `binary` and `decimal128(20,3)` over `--matcher '{__name__=":node_memory_MemAvailable_bytes:sum"}'` | 153 rows, 17 columns, exit 0; pyarrow reports every declared type and NULLs for the absent label in both the utf8 and binary columns |
+| non-representable value | same all-types schema over the whole fixture | aborts naming the column and series when a NaN sample reaches an integer column |
 | release workflow | push to `main` on an unreleased version | run 44789349646 published `v0.1.0`: 5 archives + `SHA256SUMS` |
 | release artifact | `gh release download v0.1.0` then `sha256sum -c` | checksums OK; `x86_64-unknown-linux-musl` binary is static-pie and reports `0.1.0` |
+| release gate | `gh workflow run Release -f force=false` and two pushes on the released version | `prepare` succeeds, `build` and `release` skipped |
 
 The files-mode block was opened by a real Parqtel debug server with
 `PARQTEL__STORAGE__DATA_DIR` pointed at the output directory; `/ready` returned
