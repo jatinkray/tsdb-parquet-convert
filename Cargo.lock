@@ -3116,6 +3116,7 @@ dependencies = [
  "arrow-array",
  "chrono",
  "clap",
+ "object_store",
  "otlp-sink",
  "parqtel-core",
  "parqtel-sink",
@@ -3132,6 +3133,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tsdb-reader 0.2.0",
+ "url",
  "walkdir",
  "xxhash-rust",
 ]

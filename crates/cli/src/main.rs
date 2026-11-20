@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod convert;
+mod destination;
 mod labels;
 mod metadata;
 mod presets;
@@ -9,6 +10,7 @@ mod verify;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use convert::{convert, ConvertOptions, ConvertReport};
+use destination::Destination;
 use labels::{LabelMapper, LabelMode};
 use metadata::Metadata;
 use serde_json::json;
@@ -214,8 +216,9 @@ struct PlanArgs {
 struct ConvertArgs {
     #[command(flatten)]
     source: SourceArgs,
+    /// Output directory or object-store URL (`s3://`, `gs://`, `az://`).
     #[arg(long)]
-    out: PathBuf,
+    out: String,
     #[command(flatten)]
     output: OutputArgs,
     #[arg(long, help = "Write index.fragment.json for the output blocks")]
@@ -430,12 +433,16 @@ fn inspect(args: InspectArgs) -> Result<i32> {
 }
 
 fn plan(args: PlanArgs, progress: bool) -> Result<i32> {
+    let source_label = args.source.source.clone();
     let options = build_convert_options(
         args.source,
         args.output,
-        PathBuf::new(),
-        true,
-        false,
+        OutputTarget {
+            destination: Destination::Local(PathBuf::new()),
+            source_label,
+            dry_run: true,
+            sidecar: false,
+        },
         None,
         progress,
     )?;
@@ -445,12 +452,17 @@ fn plan(args: PlanArgs, progress: bool) -> Result<i32> {
 }
 
 fn run_convert(args: ConvertArgs, dry_run: bool, progress: bool) -> Result<i32> {
+    let destination = Destination::parse(&args.out)?;
+    let source_label = args.source.source.clone();
     let options = build_convert_options(
         args.source,
         args.output,
-        args.out.clone(),
-        dry_run,
-        args.sidecar,
+        OutputTarget {
+            destination,
+            source_label,
+            dry_run,
+            sidecar: args.sidecar,
+        },
         resolve_schema(args.schema, args.preset)?,
         progress,
     )?;
@@ -589,6 +601,15 @@ fn unique_column_name(key: &str, used: &mut std::collections::BTreeSet<String>) 
     candidate
 }
 
+/// Everything about where a run writes, bundled so the option builder stays
+/// readable.
+struct OutputTarget {
+    destination: Destination,
+    source_label: String,
+    dry_run: bool,
+    sidecar: bool,
+}
+
 /// A schema either comes from a file or from the built-in presets; `clap`
 /// rejects both at once.
 fn resolve_schema(
@@ -610,12 +631,24 @@ fn resolve_schema(
 fn build_convert_options(
     source: SourceArgs,
     output: OutputArgs,
-    out_dir: PathBuf,
-    dry_run: bool,
-    sidecar: bool,
+    target: OutputTarget,
     schema: Option<parquet_sink::SchemaSpec>,
     progress: bool,
 ) -> Result<ConvertOptions> {
+    let OutputTarget {
+        destination,
+        source_label,
+        dry_run,
+        sidecar,
+    } = target;
+    if destination.is_remote() && schema.is_none() {
+        anyhow::bail!(
+            "object-store output is for schema-mode Parquet; Parqtel blocks are a local directory format — add --schema or --preset"
+        );
+    }
+    if destination.is_remote() && sidecar {
+        anyhow::bail!("--sidecar writes a local index fragment and cannot target an object store");
+    }
     if schema.is_some() {
         if sidecar {
             anyhow::bail!(
@@ -645,7 +678,12 @@ fn build_convert_options(
     }
     Ok(ConvertOptions {
         source: source.to_options()?,
-        out_dir,
+        source_label,
+        out_dir: match &destination {
+            Destination::Local(path) => path.clone(),
+            Destination::Remote { .. } => PathBuf::new(),
+        },
+        destination,
         block_duration_secs: output.block_duration_secs,
         max_rows_per_block: output.max_rows_per_block,
         writer: output.writer()?,
@@ -672,6 +710,7 @@ fn print_report(report: &ConvertReport, as_json: bool) -> Result<()> {
                 "windows": report.windows,
                 "preview": report.preview,
                 "sidecar": report.sidecar,
+                "manifest": report.manifest,
                 "retention_warning": report.retention_warning,
                 "retention_refused": report.retention_refused,
                 "stats": report.stats,
@@ -700,6 +739,9 @@ fn print_report(report: &ConvertReport, as_json: bool) -> Result<()> {
         }
         if let Some(sidecar) = &report.sidecar {
             println!("sidecar: {}", sidecar.display());
+        }
+        if let Some(manifest) = &report.manifest {
+            println!("manifest: {manifest}");
         }
         if let Some(warning) = &report.retention_warning {
             eprintln!("retention warning: {warning}");
@@ -782,12 +824,16 @@ fn clone(args: CloneArgs, dry_run: bool, progress: bool) -> Result<i32> {
     let out_dir = staging
         .as_ref()
         .map_or_else(|| target.clone(), |dir| dir.path().to_path_buf());
+    let source_label = args.source.source.clone();
     let options = build_convert_options(
         args.source,
         output,
-        out_dir.clone(),
-        dry_run,
-        false,
+        OutputTarget {
+            destination: Destination::Local(out_dir.clone()),
+            source_label,
+            dry_run,
+            sidecar: false,
+        },
         None,
         progress,
     )?;

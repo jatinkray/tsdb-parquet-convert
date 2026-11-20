@@ -1,5 +1,6 @@
 //! Streaming source → Parqtel block conversion.
 
+use crate::destination::Destination;
 use crate::labels::LabelMapper;
 use crate::metadata::Metadata;
 use anyhow::{Context, Result};
@@ -16,7 +17,10 @@ use tsdb_reader::{Labels, ScanStats, SeriesRecord, Source, SourceOptions};
 #[derive(Debug, Clone)]
 pub struct ConvertOptions {
     pub source: SourceOptions,
+    /// Source as typed on the command line, recorded in the manifest.
+    pub source_label: String,
     pub out_dir: PathBuf,
+    pub destination: Destination,
     pub block_duration_secs: u64,
     pub max_rows_per_block: usize,
     pub writer: WriterConfig,
@@ -53,6 +57,8 @@ pub struct ConvertReport {
     pub total_rows: usize,
     pub preview: Vec<String>,
     pub sidecar: Option<PathBuf>,
+    /// Where `manifest.json` was written, when the run produced one.
+    pub manifest: Option<String>,
     pub retention_warning: Option<String>,
     pub retention_refused: bool,
 }
@@ -104,6 +110,19 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertReport> {
         .and_then(|seconds| seconds.checked_mul(1_000_000_000))
         .context("block-duration-secs is too large")?;
     let source = Source::open(options.source.clone())?;
+    // Remote destinations are assembled locally and uploaded per file, so the
+    // writer always has a real directory to fsync and rename in.
+    // Held for the whole run: dropping it would delete staged files before
+    // they are uploaded.
+    let _staging: Option<tempfile::TempDir>;
+    let mut options = options.clone();
+    if options.destination.is_remote() {
+        let dir = tempfile::TempDir::new().context("creating the upload staging directory")?;
+        options.out_dir = dir.path().to_path_buf();
+        _staging = Some(dir);
+    } else {
+        _staging = None;
+    }
     let (min_ms, max_ms) = source
         .time_bounds_ms()
         .context("source selection has no samples in range")?;
@@ -138,14 +157,14 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertReport> {
     if parallel {
         let parts: Vec<ConvertReport> = ranges
             .par_iter()
-            .map(|(start, end)| convert_one_window(options, &source, window_ns, *start, *end))
+            .map(|(start, end)| convert_one_window(&options, &source, window_ns, *start, *end))
             .collect::<Result<Vec<_>>>()?;
         for part in parts {
             merge_report(&mut report, part);
         }
     } else {
         for (start, end) in ranges {
-            let part = convert_one_window(options, &source, window_ns, start, end)?;
+            let part = convert_one_window(&options, &source, window_ns, start, end)?;
             merge_report(&mut report, part);
         }
     }
@@ -164,6 +183,16 @@ pub fn convert(options: &ConvertOptions) -> Result<ConvertReport> {
             .map(|block| block.metadata.clone())
             .collect();
         report.sidecar = Some(write_sidecar_fragment(&options.out_dir, &metadata)?);
+    }
+    if options.schema.is_some() && !options.dry_run && !report.files.is_empty() {
+        let manifest = build_manifest(&options, &report)?;
+        let body = serde_json::to_string_pretty(&manifest)?;
+        let run_id = manifest.run_id.clone();
+        options.destination.write_text("manifest.json", &body)?;
+        options
+            .destination
+            .write_text(&format!("manifests/{run_id}.json"), &body)?;
+        report.manifest = Some(format!("{}/manifest.json", options.destination.describe()));
     }
     if let Some(days) = options
         .target_retention_days
@@ -351,6 +380,7 @@ fn flush_window(
         let filename = parquet_sink::block_filename(state.start_ns, state.end_ns, *part);
         if !options.dry_run {
             let file = writer.write(&options.out_dir.join(&filename))?;
+            options.destination.publish(&file.path, &file.filename)?;
             report.files.push(file);
         }
     } else {
@@ -394,6 +424,81 @@ fn flush_window(
     }
     *part = part.saturating_add(1);
     Ok(())
+}
+
+/// Machine-readable record of one conversion run, written next to the data.
+#[derive(Debug, serde::Serialize)]
+pub struct Manifest {
+    pub tool: String,
+    pub run_id: String,
+    pub created_at: String,
+    pub source: String,
+    pub destination: String,
+    pub schema: ManifestSchema,
+    pub totals: ManifestTotals,
+    pub windows: Vec<WindowPlan>,
+    pub files: Vec<ManifestFile>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ManifestSchema {
+    pub name: Option<String>,
+    /// xxHash3 of the canonical schema JSON; changes when any column changes.
+    pub hash: String,
+    pub columns: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ManifestTotals {
+    pub windows: usize,
+    pub files: usize,
+    pub rows: usize,
+    pub bytes: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ManifestFile {
+    pub name: String,
+    pub rows: usize,
+    pub bytes: u64,
+}
+
+fn build_manifest(options: &ConvertOptions, report: &ConvertReport) -> Result<Manifest> {
+    let spec = options
+        .schema
+        .as_ref()
+        .context("a manifest needs a schema")?;
+    let canonical = serde_json::to_string(spec)?;
+    let hash = xxhash_rust::xxh3::xxh3_64(canonical.as_bytes());
+    let now = chrono::Utc::now();
+    Ok(Manifest {
+        tool: format!("tsdb2parqtel {}", env!("CARGO_PKG_VERSION")),
+        run_id: format!("{}-{:016x}", now.format("%Y%m%dT%H%M%SZ"), hash),
+        created_at: now.to_rfc3339(),
+        source: options.source_label.clone(),
+        destination: options.destination.describe(),
+        schema: ManifestSchema {
+            name: spec.name.clone(),
+            hash: format!("{hash:016x}"),
+            columns: spec.columns.len(),
+        },
+        totals: ManifestTotals {
+            windows: report.windows.len(),
+            files: report.files.len(),
+            rows: report.total_rows,
+            bytes: report.files.iter().map(|file| file.bytes).sum(),
+        },
+        windows: report.windows.clone(),
+        files: report
+            .files
+            .iter()
+            .map(|file| ManifestFile {
+                name: file.filename.clone(),
+                rows: file.rows,
+                bytes: file.bytes,
+            })
+            .collect(),
+    })
 }
 
 /// Stable series identity over the label set; independent of label mapping.

@@ -18,7 +18,9 @@ reqwest = { workspace = true }
 parqtel-core = { git = "https://github.com/parqtel/parqtel-oss", rev = "63a9cf1cdc9e8cc4855565b6d0b67fa6c366cef4", version = "0.3.1" }
 walkdir = { workspace = true }
 xxhash-rust = { workspace = true }
+object_store = { workspace = true }
 parquet-sink = { workspace = true }
+url = "2"
 parqtel-sink = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
