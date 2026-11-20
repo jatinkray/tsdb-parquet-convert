@@ -11,7 +11,7 @@ mod verify;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use convert::{convert, ConvertOptions, ConvertReport};
+use convert::{convert, ConvertOptions, ConvertReport, RollupFunc};
 use destination::Destination;
 use labels::{LabelMapper, LabelMode};
 use metadata::Metadata;
@@ -243,6 +243,13 @@ struct ConvertArgs {
     /// Incremental state file: skip source blocks a previous run already wrote.
     #[arg(long, value_name = "FILE")]
     state: Option<PathBuf>,
+    /// Roll samples up per series (e.g. `30s`, `5m`, `1h`), one row per bucket.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    rollup: Option<u64>,
+    /// Aggregate held by a rollup row.
+    #[arg(long, value_name = "FUNC", default_value = "avg",
+          value_parser = ["avg", "sum", "min", "max", "last", "count"])]
+    rollup_func: String,
 }
 
 #[derive(Debug, Args)]
@@ -474,6 +481,8 @@ fn plan(args: PlanArgs, progress: bool) -> Result<i32> {
             dry_run: true,
             sidecar: false,
             state: None,
+            rollup: None,
+            rollup_func: RollupFunc::Avg,
         },
         None,
         progress,
@@ -495,6 +504,8 @@ fn run_convert(args: ConvertArgs, dry_run: bool, progress: bool) -> Result<i32> 
             dry_run,
             sidecar: args.sidecar,
             state: args.state,
+            rollup: args.rollup,
+            rollup_func: RollupFunc::parse(&args.rollup_func)?,
         },
         resolve_schema(args.schema, args.preset)?,
         progress,
@@ -657,6 +668,8 @@ struct OutputTarget {
     dry_run: bool,
     sidecar: bool,
     state: Option<PathBuf>,
+    rollup: Option<u64>,
+    rollup_func: RollupFunc,
 }
 
 /// A schema either comes from a file or from the built-in presets; `clap`
@@ -690,7 +703,12 @@ fn build_convert_options(
         dry_run,
         sidecar,
         state,
+        rollup,
+        rollup_func,
     } = target;
+    if rollup == Some(0) {
+        anyhow::bail!("--rollup must be at least one second");
+    }
     if state.is_some() && schema.is_none() {
         anyhow::bail!("--state needs --schema or --preset so every run writes the same layout");
     }
@@ -746,6 +764,8 @@ fn build_convert_options(
         schema,
         parquet: output.parquet_options(),
         state,
+        rollup_seconds: rollup,
+        rollup_func,
         dry_run,
         target_retention_days: output.target_retention_days,
         retention_refuse: output.retention_action == "refuse",
@@ -761,6 +781,7 @@ fn print_report(report: &ConvertReport, as_json: bool) -> Result<()> {
                 "blocks": report.blocks.len(),
                 "files": report.files.len(),
                 "rows": report.total_rows,
+                "rows_written": report.rows_written,
                 "windows": report.windows,
                 "preview": report.preview,
                 "sidecar": report.sidecar,
@@ -773,11 +794,12 @@ fn print_report(report: &ConvertReport, as_json: bool) -> Result<()> {
         );
     } else {
         println!(
-            "windows={} blocks={} files={} rows={} skipped_blocks={} errors={}",
+            "windows={} blocks={} files={} rows={} rows_written={} skipped_blocks={} errors={}",
             report.windows.len(),
             report.blocks.len(),
             report.files.len(),
             report.total_rows,
+            report.rows_written,
             report.blocks_skipped,
             report.stats.errors.len()
         );
@@ -890,6 +912,8 @@ fn clone(args: CloneArgs, dry_run: bool, progress: bool) -> Result<i32> {
             dry_run,
             sidecar: false,
             state: None,
+            rollup: None,
+            rollup_func: RollupFunc::Avg,
         },
         None,
         progress,
@@ -1047,6 +1071,26 @@ fn clone_otlp(args: CloneArgs, dry_run: bool) -> Result<i32> {
         checkpoint_path.display()
     );
     Ok(0)
+}
+
+/// Parses `30s`, `5m`, `1h` (or a bare number of seconds) into seconds.
+fn parse_duration(value: &str) -> Result<u64, String> {
+    let trimmed = value.trim();
+    let (number, multiplier) = match trimmed.chars().last() {
+        Some('s') => (&trimmed[..trimmed.len() - 1], 1),
+        Some('m') => (&trimmed[..trimmed.len() - 1], 60),
+        Some('h') => (&trimmed[..trimmed.len() - 1], 3_600),
+        Some(_) => (trimmed, 1),
+        None => return Err("duration is empty".to_string()),
+    };
+    let amount: u64 = number
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{value}` is not a duration such as 30s, 5m or 1h"))?;
+    amount
+        .checked_mul(multiplier)
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| format!("`{value}` is not a positive duration"))
 }
 
 fn parse_time(value: &str) -> Result<i64> {

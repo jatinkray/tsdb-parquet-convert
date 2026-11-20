@@ -35,6 +35,10 @@ pub struct ConvertOptions {
     pub parquet: WriteOptions,
     /// Incremental-run state: blocks recorded here are skipped next time.
     pub state: Option<PathBuf>,
+    /// Bucket width in seconds; `None` keeps every sample.
+    pub rollup_seconds: Option<u64>,
+    /// Which aggregate a rollup row holds.
+    pub rollup_func: RollupFunc,
     pub dry_run: bool,
     pub target_retention_days: Option<u64>,
     pub retention_refuse: bool,
@@ -64,6 +68,8 @@ pub struct ConvertReport {
     pub manifest: Option<String>,
     /// Source blocks skipped because the state file already covers them.
     pub blocks_skipped: usize,
+    /// Rows actually written (differs from `total_rows` under `--rollup`).
+    pub rows_written: usize,
     pub retention_warning: Option<String>,
     pub retention_refused: bool,
 }
@@ -86,6 +92,96 @@ struct SeriesAccum {
     labels: Labels,
     /// `(timestamp_ns, value)` in source order.
     samples: Vec<(i64, f64)>,
+    /// Per-bucket aggregates, only filled when `--rollup` is set.
+    buckets: BTreeMap<i64, Bucket>,
+}
+
+/// Running aggregate for one rollup bucket.
+#[derive(Debug, Clone, Copy)]
+struct Bucket {
+    count: u64,
+    sum: f64,
+    min: f64,
+    max: f64,
+    last_ts: i64,
+    last: f64,
+}
+
+impl Bucket {
+    fn first(ts: i64, value: f64) -> Self {
+        Self {
+            count: 1,
+            sum: value,
+            min: value,
+            max: value,
+            last_ts: ts,
+            last: value,
+        }
+    }
+
+    fn add(&mut self, ts: i64, value: f64) {
+        self.count += 1;
+        self.sum += value;
+        if value < self.min {
+            self.min = value;
+        }
+        if value > self.max {
+            self.max = value;
+        }
+        if ts >= self.last_ts {
+            self.last_ts = ts;
+            self.last = value;
+        }
+    }
+
+    fn value(&self, function: RollupFunc) -> f64 {
+        match function {
+            RollupFunc::Avg => self.sum / self.count as f64,
+            RollupFunc::Sum => self.sum,
+            RollupFunc::Min => self.min,
+            RollupFunc::Max => self.max,
+            RollupFunc::Last => self.last,
+            RollupFunc::Count => self.count as f64,
+        }
+    }
+}
+
+/// Which aggregate a rollup row holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollupFunc {
+    Avg,
+    Sum,
+    Min,
+    Max,
+    Last,
+    Count,
+}
+
+impl RollupFunc {
+    pub fn parse(value: &str) -> Result<Self> {
+        Ok(match value {
+            "avg" => Self::Avg,
+            "sum" => Self::Sum,
+            "min" => Self::Min,
+            "max" => Self::Max,
+            "last" => Self::Last,
+            "count" => Self::Count,
+            other => anyhow::bail!(
+                "unknown rollup function `{other}`; use avg, sum, min, max, last or count"
+            ),
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Avg => "avg",
+            Self::Sum => "sum",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Last => "last",
+            Self::Count => "count",
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -309,6 +405,8 @@ fn merge_report(total: &mut ConvertReport, mut part: ConvertReport) {
     total.files.append(&mut part.files);
     total.windows.append(&mut part.windows);
     total.total_rows += part.total_rows;
+    total.rows_written += part.rows_written;
+    total.blocks_skipped += part.blocks_skipped;
     total.preview.append(&mut part.preview);
 }
 
@@ -352,6 +450,15 @@ fn append_record(
         ));
     }
 
+    let bucket_ns = match options.rollup_seconds {
+        Some(seconds) => Some(
+            i64::try_from(seconds)
+                .ok()
+                .and_then(|value| value.checked_mul(1_000_000_000))
+                .context("rollup duration is too large")?,
+        ),
+        None => None,
+    };
     for sample in record.samples {
         let timestamp_ns = sample
             .timestamp_ms
@@ -373,16 +480,29 @@ fn append_record(
                 rows: 0,
                 series: BTreeMap::new(),
             });
-        state
+        let accumulator = state
             .series
             .entry(key.clone())
             .or_insert_with(|| SeriesAccum {
                 metric_name: metric_name.clone(),
                 labels: record.labels.clone(),
                 samples: Vec::new(),
-            })
-            .samples
-            .push((timestamp_ns, sample.value));
+                buckets: BTreeMap::new(),
+            });
+        match bucket_ns {
+            Some(bucket_ns) => {
+                let start = timestamp_ns.div_euclid(bucket_ns) * bucket_ns;
+                match accumulator.buckets.get_mut(&start) {
+                    Some(bucket) => bucket.add(timestamp_ns, sample.value),
+                    None => {
+                        accumulator
+                            .buckets
+                            .insert(start, Bucket::first(timestamp_ns, sample.value));
+                    }
+                }
+            }
+            None => accumulator.samples.push((timestamp_ns, sample.value)),
+        }
         state.rows += 1;
         report.total_rows += 1;
         if state.rows >= options.max_rows_per_block {
@@ -418,13 +538,16 @@ fn flush_window(
     if let Some(schema) = &options.schema {
         let mut writer = BlockWriter::new(schema.clone(), options.parquet.clone())?;
         for (index, series) in state.series.into_iter().enumerate() {
+            let rolled = rolled_samples(&series.1, options.rollup_func);
+            let samples = rolled.as_deref().unwrap_or(&series.1.samples);
+            report.rows_written += samples.len();
             writer.push_series(SeriesInput {
                 block_ulid: &key.block_ulid,
                 series_fingerprint: series.0.fingerprint,
                 series_index: index as u64,
                 metric_name: Some(series.1.metric_name.as_str()),
                 labels: &series.1.labels,
-                samples: &series.1.samples,
+                samples,
             })?;
         }
         let filename = parquet_sink::block_filename(state.start_ns, state.end_ns, *part);
@@ -439,8 +562,10 @@ fn flush_window(
             .into_values()
             .map(|series| -> Result<SeriesData> {
                 let mapped = options.label_mapper.map(&series.labels)?;
-                let mut points = Vec::with_capacity(series.samples.len());
-                for (timestamp_ns, value) in series.samples {
+                let rolled = rolled_samples(&series, options.rollup_func);
+                let samples = rolled.as_deref().unwrap_or(&series.samples);
+                let mut points = Vec::with_capacity(samples.len());
+                for &(timestamp_ns, value) in samples {
                     let point = DataPoint::new(
                         timestamp_ns,
                         MetricValue::Double(value),
@@ -449,6 +574,7 @@ fn flush_window(
                     .map_err(|e| anyhow::anyhow!("building data point: {e}"))?;
                     points.push(point);
                 }
+                report.rows_written += points.len();
                 Ok(SeriesData {
                     kind: options.metadata.kind_for(&series.metric_name),
                     metric_name: series.metric_name,
@@ -476,6 +602,21 @@ fn flush_window(
     Ok(())
 }
 
+/// Bucket aggregates as `(bucket_start_ns, aggregate)` when a rollup ran;
+/// `None` keeps the raw samples.
+fn rolled_samples(series: &SeriesAccum, function: RollupFunc) -> Option<Vec<(i64, f64)>> {
+    if series.buckets.is_empty() {
+        return None;
+    }
+    Some(
+        series
+            .buckets
+            .iter()
+            .map(|(start, bucket)| (*start, bucket.value(function)))
+            .collect(),
+    )
+}
+
 /// Machine-readable record of one conversion run, written next to the data.
 #[derive(Debug, serde::Serialize)]
 pub struct Manifest {
@@ -485,6 +626,7 @@ pub struct Manifest {
     pub source: String,
     pub destination: String,
     pub schema: ManifestSchema,
+    pub rollup: Option<ManifestRollup>,
     pub totals: ManifestTotals,
     pub windows: Vec<WindowPlan>,
     pub files: Vec<ManifestFile>,
@@ -496,6 +638,12 @@ pub struct ManifestSchema {
     /// xxHash3 of the canonical schema JSON; changes when any column changes.
     pub hash: String,
     pub columns: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ManifestRollup {
+    pub seconds: u64,
+    pub function: &'static str,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -532,10 +680,14 @@ fn build_manifest(options: &ConvertOptions, report: &ConvertReport) -> Result<Ma
             hash: format!("{hash:016x}"),
             columns: spec.columns.len(),
         },
+        rollup: options.rollup_seconds.map(|seconds| ManifestRollup {
+            seconds,
+            function: options.rollup_func.as_str(),
+        }),
         totals: ManifestTotals {
             windows: report.windows.len(),
             files: report.files.len(),
-            rows: report.total_rows,
+            rows: report.rows_written,
             bytes: report.files.iter().map(|file| file.bytes).sum(),
         },
         windows: report.windows.clone(),
@@ -564,4 +716,75 @@ pub(crate) fn fingerprint(labels: &Labels) -> u64 {
         hasher.update(&[0xfe]);
     }
     hasher.digest()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Aggregates `(timestamp, value)` samples into buckets of `bucket_ns`,
+    /// mirroring what `append_record` does.
+    fn accum(samples: &[(i64, f64)], bucket_ns: i64) -> SeriesAccum {
+        let mut series = SeriesAccum {
+            metric_name: "m".to_string(),
+            labels: Labels::new(),
+            samples: Vec::new(),
+            buckets: BTreeMap::new(),
+        };
+        for (ts, value) in samples {
+            let start = ts.div_euclid(bucket_ns) * bucket_ns;
+            match series.buckets.get_mut(&start) {
+                Some(bucket) => bucket.add(*ts, *value),
+                None => {
+                    series.buckets.insert(start, Bucket::first(*ts, *value));
+                }
+            }
+        }
+        series
+    }
+
+    #[test]
+    fn bucket_aggregates_match_the_definition() {
+        let series = accum(&[(0, 1.0), (1, 3.0), (2, 5.0)], 100);
+        let roll = rolled_samples(&series, RollupFunc::Avg).unwrap_or_default();
+        let expected = [
+            (RollupFunc::Avg, 3.0),
+            (RollupFunc::Sum, 9.0),
+            (RollupFunc::Min, 1.0),
+            (RollupFunc::Max, 5.0),
+            (RollupFunc::Last, 5.0),
+            (RollupFunc::Count, 3.0),
+        ];
+        for (function, value) in expected {
+            let rolled = rolled_samples(&series, function).unwrap_or_default();
+            assert_eq!(rolled, vec![(0, value)], "{function:?}");
+        }
+        assert_eq!(roll.len(), 1);
+    }
+
+    #[test]
+    fn last_uses_the_latest_timestamp_not_insertion_order() {
+        let mut bucket = Bucket::first(10, 1.0);
+        bucket.add(5, 9.0);
+        bucket.add(20, 2.0);
+        assert_eq!(bucket.value(RollupFunc::Last), 2.0);
+    }
+
+    #[test]
+    fn rollup_rows_are_sorted_by_bucket_start() {
+        let series = accum(&[(10, 1.0), (0, 2.0), (5, 3.0)], 5);
+        let rolled = rolled_samples(&series, RollupFunc::Avg).unwrap_or_default();
+        assert_eq!(rolled, vec![(0, 2.0), (5, 3.0), (10, 1.0)]);
+    }
+
+    #[test]
+    fn no_buckets_means_raw_samples_are_written() {
+        let series = SeriesAccum {
+            metric_name: "m".to_string(),
+            labels: Labels::new(),
+            samples: vec![(1, 2.0)],
+            buckets: BTreeMap::new(),
+        };
+        assert!(rolled_samples(&series, RollupFunc::Avg).is_none());
+    }
 }
